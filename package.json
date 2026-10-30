@@ -1,0 +1,9 @@
+{
+  "name": "codex-ssh-webui",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": { "start": "node src/server.mjs --mock", "test": "node --test test/*.test.mjs" }
+}

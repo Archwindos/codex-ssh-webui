@@ -1,0 +1,9 @@
+{
+  "accessMode": "ssh-loopback-http",
+  "eventTransport": "poll",
+  "transport": "local",
+  "remoteCodex": "/home/demo/.local/bin/codex",
+  "projects": [{ "id": "workspace", "name": "Workspace", "cwd": "/workspace" }],
+  "workspace": { "roots": ["/workspace"], "defaultCwd": "/workspace" },
+  "verifiedProtocol": { "version": "0.165.0", "verified": false, "schemaVerified": false }
+}
