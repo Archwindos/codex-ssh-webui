@@ -1,11 +1,13 @@
 // This process implements only local fixtures. It never launches Codex or SSH.
 import { createInterface } from 'node:readline';
 const threads = new Map(); const running = new Map(); const approvals = new Map();
-let threadNo = 0, turnNo = 0, requestNo = 0;
+const projects = new Map(), projectRequests = new Map();
+const pinnedSection = { id: '01984de2-8f74-7c91-a3b2-5c5e937cf318', name: 'Pinned', appearance: null };
+let threadNo = 0, turnNo = 0, requestNo = 0, projectNo = 0;
 const send = x => process.stdout.write(JSON.stringify(x) + '\n');
 const notify = (method, params) => send({ method, params });
 const respond = (id, result) => send({ id, result });
-const foreign = { id: 'foreign-thread', cwd: '/private/foreign', preview: 'MUST_NOT_LEAK', name: 'MUST_NOT_LEAK', source: 'cli', status: { type: 'notLoaded' }, createdAt: 1, updatedAt: 1, turns: [] };
+const foreign = { id: 'foreign-thread', cwd: '/private/foreign', projectId: null, section: null, sectionEnteredAt: null, recencyAt: 1, preview: 'MUST_NOT_LEAK', name: 'MUST_NOT_LEAK', source: 'cli', status: { type: 'notLoaded' }, createdAt: 1, updatedAt: 1, turns: [] };
 threads.set(foreign.id, foreign);
 function complete(threadId, turn, status) {
   const active = running.get(threadId); if (!active || active.turn.id !== turn.id) return;
@@ -36,17 +38,49 @@ createInterface({ input: process.stdin }).on('line', line => {
   if (method === 'initialized') return;
   if (method === 'initialize') return respond(id, { userAgent: 'mock-app-server/0.165.0', platformFamily: 'mock', platformOs: 'mock' });
   if (method === 'account/read') return respond(id, { account: { type: 'chatgpt' }, requiresOpenaiAuth: true });
+  if (method === 'threadSection/list') return respond(id, { data: [pinnedSection], nextCursor: null });
+  if (method === 'project/list') {
+    const all = [...projects.values()], from = Number(p.cursor || 0), limit = p.limit || 50;
+    return respond(id, { data: all.slice(from, from + limit), nextCursor: from + limit < all.length ? String(from + limit) : null });
+  }
+  if (method === 'project/create') {
+    const previous = projectRequests.get(p.idempotencyKey);
+    if (previous) {
+      if (previous.input !== JSON.stringify(p)) return send({ id, error: { code: -32602, message: 'Idempotency conflict' } });
+      return respond(id, { project: projects.get(previous.id) });
+    }
+    const now = Math.floor(Date.now() / 1000), project = { id: `mock-project-${++projectNo}`, name: p.name, roots: p.roots, metadata: p.metadata || {}, position: projectNo, createdAt: now, updatedAt: now, recencyAt: null };
+    projects.set(project.id, project); projectRequests.set(p.idempotencyKey, { input: JSON.stringify(p), id: project.id });
+    respond(id, { project }); notify('project/changed', { projectId: project.id, changeType: 'created' }); return;
+  }
+  if (method === 'project/read' || method === 'project/update') {
+    const project = projects.get(p.projectId);
+    if (!project) return send({ id, error: { code: -32602, message: 'Project not found' } });
+    if (method === 'project/update') { for (const key of ['name', 'roots', 'metadata']) if (Object.hasOwn(p, key)) project[key] = p[key]; project.updatedAt = Math.floor(Date.now() / 1000); notify('project/changed', { projectId: project.id, changeType: 'updated' }); }
+    return respond(id, { project });
+  }
   if (method === 'thread/list') {
-    const all = [...threads.values()].filter(thread => !p.cwd || thread.cwd === p.cwd).filter(thread => !p.sourceKinds?.length || p.sourceKinds.includes(thread.source));
+    const all = [...threads.values()].filter(thread => !p.cwd || thread.cwd === p.cwd).filter(thread => !p.sourceKinds?.length || p.sourceKinds.includes(thread.source)).filter(thread => !Object.hasOwn(p, 'projectId') || thread.projectId === p.projectId).filter(thread => !Object.hasOwn(p, 'sectionId') || (thread.section?.id || null) === p.sectionId).filter(thread => !p.searchTerm || (thread.name || thread.preview || '').toLowerCase().includes(p.searchTerm.toLowerCase())).filter(thread => Boolean(thread.archived) === Boolean(p.archived));
     const from = Number(p.cursor || 0), limit = p.limit || 50;
     return respond(id, { data: all.slice(from, from + limit), nextCursor: from + limit < all.length ? String(from + limit) : null });
   }
   if (method === 'thread/start') {
     const now = Math.floor(Date.now() / 1000);
-    const thread = { id: `mock-thread-${++threadNo}`, cwd: p.cwd, preview: '【模拟】新会话', name: '模拟会话', source: 'appServer', status: { type: 'idle' }, createdAt: now, updatedAt: now, turns: [] }; threads.set(thread.id, thread); respond(id, { thread }); notify('thread/started', { thread }); return;
+    if (p.projectId && !projects.has(p.projectId)) return send({ id, error: { code: -32602, message: 'Project not found' } });
+    const thread = { id: `mock-thread-${++threadNo}`, cwd: p.cwd, projectId: p.projectId || null, section: null, sectionEnteredAt: null, recencyAt: now, preview: '【模拟】新会话', name: '模拟会话', source: 'appServer', status: { type: 'idle' }, createdAt: now, updatedAt: now, turns: [] }; threads.set(thread.id, thread); respond(id, { thread }); notify('thread/started', { thread }); return;
   }
   const thread = threads.get(p.threadId);
   if (!thread) return send({ id, error: { code: -32602, message: 'Thread not found' } });
+  if (method === 'thread/name/set') { thread.name = p.name; respond(id, {}); notify('thread/name/updated', { threadId: thread.id, threadName: thread.name }); return; }
+  if (method === 'thread/section/move') {
+    if (p.sectionId !== null && p.sectionId !== pinnedSection.id) return send({ id, error: { code: -32602, message: 'Unknown section' } });
+    thread.section = p.sectionId ? pinnedSection : null; thread.sectionEnteredAt = p.sectionId ? Math.floor(Date.now() / 1000) : null; return respond(id, {});
+  }
+  if (method === 'thread/metadata/update') {
+    if (p.projectId && !projects.has(p.projectId)) return send({ id, error: { code: -32602, message: 'Project not found' } });
+    if (typeof p.projectId === 'string') { thread.projectId = p.projectId || null; notify('thread/project/updated', { threadId: thread.id, projectId: thread.projectId }); }
+    return respond(id, { thread: { ...thread, turns: [] } });
+  }
   if (method === 'thread/read' || method === 'thread/resume') return respond(id, { thread: { ...thread, turns: p.includeTurns === true ? thread.turns : [] } });
   if (method === 'thread/turns/list') {
     const from = Number(p.cursor || 0); const all = [...thread.turns].reverse(); const data = all.slice(from, from + p.limit); return respond(id, { data, nextCursor: from + p.limit < all.length ? String(from + p.limit) : null });

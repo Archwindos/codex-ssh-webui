@@ -4,33 +4,34 @@ import { EventEmitter } from 'node:events';
 import { join, dirname, resolve } from 'node:path';
 import { RuntimeRpc, WorkerConnection, createRuntimePlatform, parseRuntimePane, approvalId, runtimeEnvironment } from '../src/runtimes.mjs';
 import { startRuntimeWorker } from '../src/runtime-worker.mjs';
+import { createRuntimeCleanup } from '../src/runtime-cleanup.mjs';
 
 const flush = () => new Promise(done => setImmediate(done));
 const copy = value => JSON.parse(JSON.stringify(value));
-const config = { transport: 'local', remoteCodex: '/home/demo/.local/bin/codex', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
+const config = { transport: 'local', remoteCodex: '/opt/codex/bin/codex', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
 const errno = code => Object.assign(Error(code), { code });
 
 class MemoryLinux {
   constructor(root) {
     this.entries = new Map(); this.processes = new Map(); this.nextInode = 100;
-    for (const path of [root, join(root, 'runtime'), '/tmp/tmux-1000']) this.directory(path);
-    this.socket('/tmp/tmux-1000/default', 0o660);
+    for (const path of [root, join(root, 'runtime'), '/tmp/tmux-1022']) this.directory(path);
+    this.socket('/tmp/tmux-1022/default', 0o660);
   }
   key(path) { return String(path).replaceAll('\\', '/'); }
-  directory(path) { this.entries.set(this.key(path), { kind: 'directory', mode: 0o700, uid: 1000, ino: this.nextInode++ }); }
-  socket(path, mode = 0o600) { this.entries.set(this.key(path), { kind: 'socket', mode, uid: 1000 }); }
+  directory(path) { this.entries.set(this.key(path), { kind: 'directory', mode: 0o700, uid: 1022, ino: this.nextInode++ }); }
+  socket(path, mode = 0o600) { this.entries.set(this.key(path), { kind: 'socket', mode, uid: 1022 }); }
   info(entry) { return { ...entry, dev: entry.dev || 1, ino: entry.ino || 2, size: Buffer.byteLength(entry.data || ''), isFile: () => entry.kind === 'file', isDirectory: () => entry.kind === 'directory', isSocket: () => entry.kind === 'socket', isSymbolicLink: () => entry.kind === 'symlink' }; }
   async lstat(path) { const item = this.entries.get(this.key(path)); if (!item) throw errno('ENOENT'); return this.info(item); }
-  async stat(path) { if (/^\/proc\/\d+$/.test(path)) { if (!this.processes.has(Number(path.split('/')[2]))) throw errno('ENOENT'); return { uid: 1000 }; } return this.lstat(path); }
+  async stat(path) { if (/^\/proc\/\d+$/.test(path)) { if (!this.processes.has(Number(path.split('/')[2]))) throw errno('ENOENT'); return { uid: 1022 }; } return this.lstat(path); }
   async realpath(path) { if (!this.entries.has(this.key(path))) throw errno('ENOENT'); return path; }
   async mkdir(path, options = {}) { if (this.entries.has(this.key(path))) throw errno('EEXIST'); this.directory(path); this.entries.get(this.key(path)).mode = options.mode || 0o700; }
-  async writeFile(path, data, options = {}) { const key = this.key(path); if (options.flag === 'wx' && this.entries.has(key)) throw errno('EEXIST'); this.entries.set(key, { kind: 'file', uid: 1000, mode: options.mode || 0o600, ino: this.nextInode++, data: String(data) }); }
+  async writeFile(path, data, options = {}) { const key = this.key(path); if (options.flag === 'wx' && this.entries.has(key)) throw errno('EEXIST'); this.entries.set(key, { kind: 'file', uid: 1022, mode: options.mode || 0o600, ino: this.nextInode++, data: String(data) }); }
   async readFile(path, encoding) {
     const match = /^\/proc\/(\d+)\/(stat|cmdline)$/.exec(path);
     if (match) {
       const entry = this.processes.get(Number(match[1])); if (!entry) throw errno('ENOENT');
       if (match[2] === 'cmdline') return Buffer.from(entry.commandline.join('\0') + '\0');
-      const fields = ['S', String(entry.ppid), String(entry.pid), String(entry.pid), ...Array(15).fill('0'), entry.startTicks, '0'];
+      const fields = ['S', String(entry.ppid), String(entry.pgid ?? entry.pid), String(entry.sid ?? entry.pid), String(entry.tty ?? 0), ...Array(14).fill('0'), entry.startTicks, '0'];
       return `${entry.pid} (fixture process) ${fields.join(' ')}`;
     }
     const item = this.entries.get(this.key(path)); if (!item) throw errno('ENOENT');
@@ -42,7 +43,7 @@ class MemoryLinux {
   async unlink(path) { if (!this.entries.delete(this.key(path))) throw errno('ENOENT'); }
   async rmdir(path) { if ((await this.readdir(path)).length) throw errno('ENOTEMPTY'); return this.unlink(path); }
   async chmod(path, mode) { const item = this.entries.get(this.key(path)); if (!item) throw errno('ENOENT'); item.mode = mode; }
-  async readdir(path) { const prefix = this.key(path) + '/'; return [...new Set([...this.entries.keys()].filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length).split('/')[0]))]; }
+  async readdir(path) { if (path === '/proc') return [...this.processes.keys()].map(String); const prefix = this.key(path) + '/'; return [...new Set([...this.entries.keys()].filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length).split('/')[0]))]; }
 }
 
 class SocketEnd extends EventEmitter {
@@ -73,30 +74,37 @@ async function fixture(t, scenario = {}) {
   // This filesystem is entirely in memory. A short absolute Linux fixture
   // keeps the Unix socket limit independent of the deployment staging path.
   const root = resolve('/fixture-runtime-root'), linux = new MemoryLinux(root), threads = new Map(), servers = new Map(), workers = new Map(), commands = [];
-  let counter = 200, newCalls = 0;
+  let counter = 200, newCalls = 0, time = 1000;
   const sessions = new Map([['$1', { sessionName: 'manual-a', paneId: '%0', panePid: 50 }], ['$3', { sessionName: 'manual-b', paneId: '%8', panePid: 60 }]]);
   linux.processes.set(40, { pid: 40, ppid: 1, startTicks: '400', executable: '/usr/bin/tmux', commandline: ['tmux: server'] });
   linux.processes.set(1111, { pid: 1111, ppid: 1, startTicks: '11110', executable: process.execPath, commandline: [process.execPath] });
   const line = pane => [40, pane.sessionId, pane.sessionName, pane.windowId, pane.windowIndex, pane.paneId, pane.paneIndex, pane.panePid].join('|') + '\n';
   const exec = async (command, raw, options) => {
-    assert.equal(command, '/usr/bin/tmux'); assert.deepEqual(raw.slice(0, 2), ['-S', '/tmp/tmux-1000/default']);
+    assert.equal(command, '/usr/bin/tmux'); assert.deepEqual(raw.slice(0, 2), ['-S', '/tmp/tmux-1022/default']);
     assert.equal(options.env.RELAY_ACCESS_SECRET, undefined); const args = raw.slice(2); commands.push(args);
-    if (args[0] === 'display-message') { if (!linux.processes.has(40)) throw Object.assign(Error('closed'), { code: 1, stdout: '', stderr: 'closed' }); return { stdout: '40\n', stderr: '' }; }
+    if (args[0] === 'display-message') { if (!linux.processes.has(40)) throw Object.assign(Error('closed'), { code: 1, stdout: '', stderr: 'closed' }); return { stdout: args.at(-1) === '#{session_attached}' ? `${scenario.attached || 0}\n` : '40\n', stderr: '' }; }
     if (args[0] === 'list-sessions') return { stdout: [...sessions.values()].map(pane => pane.sessionName).join('\n'), stderr: '' };
     if (args[0] === 'new-session') {
       if (scenario.falseSuccessTmuxNewSession) { newCalls++; return { stdout: '', stderr: 'error creating default socket (No such file or directory)' }; }
-      if (!linux.processes.has(40)) { linux.processes.set(40, { pid: 40, ppid: 1, startTicks: '401', executable: '/usr/bin/tmux', commandline: ['tmux: server'] }); linux.entries.get('/tmp/tmux-1000/default').ino++; }
+      if (!linux.processes.has(40)) { linux.processes.set(40, { pid: 40, ppid: 1, startTicks: '401', executable: '/usr/bin/tmux', commandline: ['tmux: server'] }); linux.entries.get('/tmp/tmux-1022/default').ino++; }
       newCalls++; const sessionName = args[args.indexOf('-s') + 1], id = sessionName.slice('codex-chat-'.length), directory = join(root, 'runtime', 'runs', id);
       if ([...sessions.values()].some(pane => pane.sessionName === sessionName)) throw Object.assign(Error('duplicate'), { code: 1, stdout: '', stderr: 'duplicate' });
       const pid = counter++, pane = { sessionId: `$${pid}`, sessionName, windowId: `@${pid + 10}`, windowIndex: 2, paneId: `%${pid + 20}`, paneIndex: 3, panePid: pid };
       sessions.set(pane.sessionId, pane);
-      linux.processes.set(pid, { pid, ppid: 40, startTicks: `${pid}0`, executable: process.execPath, commandline: [process.execPath, join(root, 'src', 'runtime-worker.mjs'), '--run-dir', directory] });
+      linux.processes.set(pid, { pid, ppid: 40, tty: scenario.tty || 0, startTicks: `${pid}0`, executable: process.execPath, commandline: [process.execPath, join(root, 'src', 'runtime-worker.mjs'), '--run-dir', directory] });
       assert.match(args.at(-1), /env' '-i'/); assert.doesNotMatch(args.at(-1), /TEST_SECRET|RELAY_ACCESS_SECRET|OPENAI_API_KEY/);
       assert.match(args.at(-1), /"TMUX=\$TMUX" "TMUX_PANE=\$TMUX_PANE"/);
       assert.deepEqual(args.at(-1).match(/"[A-Z_]+=\$[A-Z_]+"/g), ['"TMUX=$TMUX"', '"TMUX_PANE=$TMUX_PANE"']);
       return { stdout: line(pane), stderr: '' };
     }
-    if (args[0] === 'list-panes') { const pane = sessions.get(args[args.indexOf('-t') + 1]); if (!pane) throw Object.assign(Error('gone'), { code: 1, stdout: '', stderr: 'gone' }); return { stdout: line(pane), stderr: '' }; }
+    if (args[0] === 'list-panes') { const pane = sessions.get(args[args.indexOf('-t') + 1]); if (!pane) throw Object.assign(Error('gone'), { code: 1, stdout: '', stderr: 'gone' }); return { stdout: line(pane) + (pane.extraPane ? line({ ...pane, ...pane.extraPane }) : ''), stderr: '' }; }
+    if (args[0] === 'if-shell') {
+      assert.deepEqual(args.slice(0, 4), ['if-shell', '-F', '-t', args[3]]);
+      assert.match(args[4], /session_attached/); assert.match(args[4], /session_windows/); assert.match(args[4], /window_panes/); assert.match(args[4], /pane_pid/);
+      const found = [...sessions].find(([, pane]) => pane.paneId === args[3]);
+      if (!found || scenario.attached || scenario.attachAtStop || found[1].extraPane) return { stdout: 'runtime_cleanup_blocked\n', stderr: '' };
+      const [sessionId, pane] = found, worker = [...workers.values()].find(value => value.pid === pane.panePid); worker?.instance.close(); linux.processes.delete(pane.panePid); sessions.delete(sessionId); return { stdout: '', stderr: '' };
+    }
     if (args[0] === 'kill-pane') {
       const found = [...sessions].find(([, pane]) => pane.paneId === args.at(-1)); if (!found) throw Error('unknown pane');
       const [sessionId, pane] = found; const worker = [...workers.values()].find(value => value.pid === pane.panePid); worker?.instance.close(); linux.processes.delete(pane.panePid); sessions.delete(sessionId); return { stdout: '', stderr: '' };
@@ -105,7 +113,7 @@ async function fixture(t, scenario = {}) {
   };
   let recovering = Promise.resolve();
   const recoveryMutex = operation => { const result = recovering.then(operation); recovering = result.catch(() => {}); return result; };
-  const platform = createRuntimePlatform({ root, filesystem: linux, uid: () => 1000, pid: () => 1111, recoveryMutex, exec, env: { HOME: '/home/demo', PATH: '/usr/bin', RELAY_ACCESS_SECRET: 'TEST_SECRET', OPENAI_API_KEY: 'TEST_SECRET' } });
+  const platform = createRuntimePlatform({ root, filesystem: linux, uid: () => 1022, pid: () => 1111, clock: () => time, recoveryMutex, exec, env: { HOME: '/workspace', PATH: '/usr/bin', RELAY_ACCESS_SECRET: 'TEST_SECRET', OPENAI_API_KEY: 'TEST_SECRET' } });
   const originalReadReceipt = platform.readReceipt.bind(platform);
   const createIPCServer = handler => {
     const server = new EventEmitter(); server.handler = handler;
@@ -116,7 +124,7 @@ async function fixture(t, scenario = {}) {
     const id = receipt.id;
     if (workers.has(id)) return;
     const entry = { pid: receipt.worker.pid }; workers.set(id, entry);
-    entry.instance = await startRuntimeWorker({ runDir: platform.runDir(id), platform: { ...platform, readReceipt: originalReadReceipt }, workerPid: receipt.worker.pid,
+    entry.instance = await startRuntimeWorker({ runDir: platform.runDir(id), platform: { ...platform, readReceipt: originalReadReceipt }, workerPid: receipt.worker.pid, clock: () => time,
       env: { TMUX_PANE: receipt.tmux.paneId, TMUX: `${receipt.tmux.socket},${receipt.tmux.serverPid},${receipt.tmux.sessionId.slice(1)}` },
       rpcFactory: () => (entry.rpc = new FakeRpc(linux, threads, { workerPid: receipt.worker.pid })), createIPCServer,
       onExit: () => { linux.processes.delete(receipt.worker.pid); sessions.delete(receipt.tmux.sessionId); } });
@@ -139,7 +147,7 @@ async function fixture(t, scenario = {}) {
     const rpc = new RuntimeRpc(config, { platform, rpcFactory: () => new FakeRpc(linux, threads, { workerPid: libraryCounter++, library: true }) }); managers.push(rpc); return rpc;
   };
   t.after(async () => { for (const rpc of managers) rpc.close(); for (const worker of workers.values()) worker.instance?.close(); await flush(); });
-  return { root, linux, threads, sessions, platform, workers, manager, commands, newCalls: () => newCalls };
+  return { root, linux, threads, sessions, platform, workers, manager, commands, clock: () => time, advance: ms => { time += ms; }, newCalls: () => newCalls };
 }
 
 async function seedGuard(f, { pid = 700, startTicks = '7000', owner = 'a'.repeat(32) } = {}) {
@@ -159,17 +167,17 @@ test('ASCII tmux identity parser preserves allocated IDs and rejects forged rows
 
 test('initialize creates only the missing standard UID tmux directory with mode 0700', async t => {
   const f = await fixture(t);
-  await f.linux.unlink('/tmp/tmux-1000/default'); await f.linux.rmdir('/tmp/tmux-1000');
+  await f.linux.unlink('/tmp/tmux-1022/default'); await f.linux.rmdir('/tmp/tmux-1022');
   const created = [], mkdir = f.linux.mkdir.bind(f.linux);
   f.linux.mkdir = async (path, options) => { created.push({ path, mode: options.mode }); return mkdir(path, options); };
   await f.platform.initialize();
-  const info = await f.linux.lstat('/tmp/tmux-1000'); assert.equal(info.mode & 0o777, 0o700); assert.equal(info.uid, 1000);
-  assert.deepEqual(created.filter(row => row.path.startsWith('/tmp')), [{ path: '/tmp/tmux-1000', mode: 0o700 }]);
+  const info = await f.linux.lstat('/tmp/tmux-1022'); assert.equal(info.mode & 0o777, 0o700); assert.equal(info.uid, 1022);
+  assert.deepEqual(created.filter(row => row.path.startsWith('/tmp')), [{ path: '/tmp/tmux-1022', mode: 0o700 }]);
 });
 
 test('initialize refuses unsafe existing default directories without changing their permissions', async t => {
   for (const changes of [{ mode: 0o755 }, { uid: 0 }, { kind: 'symlink' }]) {
-    const f = await fixture(t), directory = f.linux.entries.get('/tmp/tmux-1000'); Object.assign(directory, changes);
+    const f = await fixture(t), directory = f.linux.entries.get('/tmp/tmux-1022'); Object.assign(directory, changes);
     const before = copy(directory); let chmods = 0;
     f.linux.chmod = async () => { chmods++; assert.fail('existing directory must not be chmodded'); };
     await assert.rejects(f.platform.initialize(), { code: 'runtime_permissions' });
@@ -250,7 +258,7 @@ test('already stopped receipts ignore a replacement default server and safely re
   const f = await fixture(t), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
   const row = (await rpc.listRuns())[0], receipt = await f.platform.readReceipt(row.id);
   await rpc.stopRun(row.id, row.revision); await flush();
-  f.linux.processes.get(40).startTicks = 'replacement-server'; f.linux.entries.get('/tmp/tmux-1000/default').ino = 999;
+  f.linux.processes.get(40).startTicks = 'replacement-server'; f.linux.entries.get('/tmp/tmux-1022/default').ino = 999;
   for (const old of [receipt.worker, receipt.codex]) f.linux.processes.set(old.pid, { pid: old.pid, ppid: 1, startTicks: old.startTicks + '1', executable: '/unrelated/process', commandline: ['/unrelated/process'] });
   const commandsBefore = f.commands.length, processesBefore = copy([...f.linux.processes]);
   assert.deepEqual(await f.platform.stop(receipt), { alreadyAbsent: true });
@@ -260,7 +268,7 @@ test('already stopped receipts ignore a replacement default server and safely re
 test('an original process still alive cannot bypass changed tmux identity during stop', async t => {
   const f = await fixture(t), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
   const row = (await rpc.listRuns())[0], receipt = await f.platform.readReceipt(row.id);
-  f.linux.entries.get('/tmp/tmux-1000/default').ino = 999;
+  f.linux.entries.get('/tmp/tmux-1022/default').ino = 999;
   await assert.rejects(f.platform.stop(receipt), { code: 'runtime_socket_changed' });
   assert.equal(f.commands.some(args => args[0] === 'kill-pane'), false); assert.ok(f.linux.processes.has(receipt.worker.pid)); assert.ok(f.linux.processes.has(receipt.codex.pid));
 });
@@ -274,9 +282,9 @@ test('process/socket identity changes remove receipts from live rows and forbid 
 
 test('socket inode changes and unknown same-name sessions never grant control', async t => {
   const f = await fixture(t), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
-  const row = (await rpc.listRuns())[0]; f.linux.entries.get('/tmp/tmux-1000/default').ino = 999;
+  const row = (await rpc.listRuns())[0]; f.linux.entries.get('/tmp/tmux-1022/default').ino = 999;
   assert.deepEqual(await rpc.listRuns(), []); await assert.rejects(rpc.stopRun(row.id, row.revision), { code: 'runtime_changed' });
-  f.linux.entries.get('/tmp/tmux-1000/default').ino = 2;
+  f.linux.entries.get('/tmp/tmux-1022/default').ino = 2;
   f.sessions.set('$99', { sessionName: 'codex-chat-aaaaaaaaaaaaaaaa', paneId: '%99', panePid: 999 });
   await assert.rejects(f.platform.launch('aaaaaaaaaaaaaaaa', { method: 'thread/start', params: { cwd: '/a' }, config }), { code: 'runtime_session_exists' });
   assert.equal(f.commands.some(args => args[0] === 'kill-pane'), false); assert.ok(f.sessions.has('$99'));
@@ -289,6 +297,19 @@ test('closing a runner does not emit the global closed event or archive its dura
   assert.equal(globalClosed, 0); assert.equal(rpc.connected, true); assert.equal((await rpc.listRuns()).length, 1);
   const list = await rpc.call('thread/list', {}); assert.ok(list.data.some(thread => thread.id === first.thread.id));
   const reopened = await rpc.call('thread/resume', { threadId: first.thread.id, cwd: '/a' }); assert.equal(reopened.thread.id, first.thread.id); assert.equal(f.newCalls(), 3);
+});
+
+test('late closure of a superseded runtime retains the identity and current same-thread runtime', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' });
+  const old = await rpc.findThread(thread.id), receipt = old.receipt, events = []; rpc.on('runtimeClosed', event => events.push(event));
+  // The tmux processes died, but the old IPC close event has not arrived yet.
+  f.linux.processes.delete(receipt.worker.pid); f.linux.processes.delete(receipt.codex.pid); f.sessions.delete(receipt.tmux.sessionId);
+  await rpc.call('thread/resume', { threadId: thread.id, cwd: '/a' }); const current = await rpc.findThread(thread.id);
+  assert.notEqual(current.receipt.id, receipt.id); old.connection.close();
+  assert.deepEqual(events[0], { id: receipt.id, runtimeId: receipt.id, threadId: thread.id, superseded: true });
+  assert.equal(rpc.threadRuns.get(thread.id), current); assert.equal((await rpc.findThread(thread.id)).receipt.id, current.receipt.id);
+  assert.ok((await rpc.call('turn/start', { threadId: thread.id, input: [] })).turn.id);
+  current.connection.close(); assert.equal(events.at(-1).superseded, false); assert.equal(events.at(-1).runtimeId, current.receipt.id);
 });
 
 test('RPC timeout is propagated once without replaying the submitted turn', async t => {
@@ -451,11 +472,299 @@ test('freeze rollback preserves a marker replaced by another operation', async t
 });
 
 test('worker and tmux environments exclude gateway secret/provider settings', () => {
-  assert.deepEqual(runtimeEnvironment({ HOME: '/home/demo', PATH: '/usr/bin', LANG: 'C', RELAY_ACCESS_SECRET: 'secret', OPENAI_API_KEY: 'secret', HTTP_PROXY: 'proxy', TMUX: 'other', CODEX_HOME: '/unapproved' }), { HOME: '/home/demo', PATH: '/usr/bin', LANG: 'C' });
+  assert.deepEqual(runtimeEnvironment({ HOME: '/workspace', PATH: '/usr/bin', LANG: 'C', RELAY_ACCESS_SECRET: 'secret', OPENAI_API_KEY: 'secret', HTTP_PROXY: 'proxy', TMUX: 'other', CODEX_HOME: '/unapproved' }), { HOME: '/workspace', PATH: '/usr/bin', LANG: 'C' });
 });
 
 test('mock mode starts no tmux and reuses the ordinary mock RPC', async () => {
   const library = new EventEmitter(); library.start = async () => {}; library.call = async method => ({ method }); library.close = () => {}; library.child = { pid: 1 };
   const rpc = new RuntimeRpc({}, { mock: true, rpcFactory: () => library, platform: new Proxy({}, { get() { throw Error('mock must not touch platform'); } }) });
   await rpc.start(); assert.deepEqual(await rpc.call('thread/start', {}), { method: 'thread/start' }); assert.deepEqual(await rpc.listRuns(), []); rpc.close();
+});
+
+const cleanupFor = (rpc, f) => createRuntimeCleanup({ rpc, clock: f.clock });
+
+test('idle cleanup waits 120 minutes, stops only a dedicated worker, and preserves the conversation', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start();
+  const { thread } = await rpc.call('thread/start', { cwd: '/a', projectId: null }), cleaner = cleanupFor(rpc, f);
+  const initial = (await rpc.listRuns())[0]; assert.equal(initial.lifecycle.version, 2); assert.equal(initial.lifecycle.idleSince, f.clock()); assert.equal(initial.lifecycle.lastOutputAt, f.clock());
+  f.advance(120 * 60 * 1000 - 1); assert.deepEqual(await cleaner.maintenance(), []); assert.equal((await rpc.listRuns()).length, 1);
+  f.advance(1); assert.equal((await cleaner.maintenance())[0].stopped, true); assert.equal((await rpc.listRuns()).length, 0);
+  assert.equal(f.threads.get(thread.id).id, thread.id); assert.ok(f.sessions.has('$1')); assert.ok(f.sessions.has('$3'));
+  assert.equal(f.commands.filter(args => args[0] === 'if-shell').length, 1); assert.equal(f.commands.some(args => args[0] === 'kill-session' || args[0] === 'kill-server'), false);
+});
+
+test('a terminal event does not start idle timeout until the saved latest turn is terminal', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' });
+  const { turn } = await rpc.call('turn/start', { threadId: thread.id, input: [{ type: 'text', text: 'test' }] }), worker = [...f.workers.values()][0];
+  worker.rpc.emit('notification', { method: 'turn/completed', params: { threadId: thread.id, turn: { id: turn.id, status: 'completed' } } });
+  f.advance(120 * 60 * 1000); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []); assert.equal((await rpc.listRuns())[0].lifecycle.idleSince, null);
+  f.threads.get(thread.id).turns.at(-1).status = 'completed';
+  const saved = (await rpc.listRuns())[0]; assert.equal(saved.lifecycle.idleSince, f.clock());
+  f.advance(120 * 60 * 1000); assert.equal((await cleanupFor(rpc, f).maintenance())[0].stopped, true);
+});
+
+test('keep-running persists across gateway restart, manual stop and runtime recreation', async t => {
+  const f = await fixture(t), first = f.manager(); await first.start(); const { thread } = await first.call('thread/start', { cwd: '/a' });
+  assert.deepEqual(await first.setKeepRunning(thread.id, true), { threadId: thread.id, keepRunning: true }); first.close();
+  const second = f.manager(); await second.start(); assert.equal((await second.listRuns())[0].keepRunning, true);
+  f.advance(3 * 60 * 60 * 1000); assert.deepEqual(await cleanupFor(second, f).maintenance(), []);
+  const row = (await second.listRuns())[0]; await second.stopRun(row.id, row.revision); await second.call('thread/resume', { threadId: thread.id, projectId: null });
+  assert.equal((await second.listRuns())[0].keepRunning, true); assert.equal((await second.getKeepRunning(thread.id)).keepRunning, true);
+  await second.setKeepRunning(thread.id, false); f.advance(2 * 60 * 60 * 1000); assert.equal((await cleanupFor(second, f).maintenance())[0].stopped, true);
+});
+
+test('human attachment, extra panes and background or orphaned session processes prevent idle cleanup', async t => {
+  for (const scenario of ['attached', 'extra-pane', 'background', 'orphaned']) await t.test(scenario, async t => {
+    const settings = {}, f = await fixture(t, settings), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
+    const row = (await rpc.listRuns())[0], receipt = await f.platform.readReceipt(row.id);
+    if (scenario === 'attached') settings.attached = 1;
+    if (scenario === 'extra-pane') f.sessions.get(row.tmux.sessionId).extraPane = { paneId: '%999', panePid: 999, paneIndex: 4 };
+    if (scenario === 'background') f.linux.processes.set(999, { pid: 999, ppid: receipt.codex.pid, startTicks: '9990', executable: '/bin/sleep', commandline: ['/bin/sleep', '999'] });
+    if (scenario === 'orphaned') {
+      f.linux.processes.set(999, { pid: 999, ppid: 1, startTicks: '9990', executable: '/bin/sleep', commandline: ['/bin/sleep', '999'] });
+      const read = f.linux.readFile.bind(f.linux); f.linux.readFile = async (path, encoding) => { const value = await read(path, encoding); if (path === '/proc/999/stat') { const parts = String(value).split(' '); parts[6] = String(receipt.worker.sid); return parts.join(' '); } return value; };
+    }
+    f.advance(2 * 60 * 60 * 1000); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []); assert.equal((await rpc.listRuns())[0].lifecycle.idleSince, null); assert.equal(f.commands.some(args => args[0] === 'kill-pane'), false);
+  });
+});
+
+test('approval, user input, active child threads, unknown status and unsupported events prevent cleanup', async t => {
+  for (const scenario of ['approval', 'input', 'child', 'sub-agent', 'unknown', 'unsupported']) await t.test(scenario, async t => {
+    const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }), worker = [...f.workers.values()][0];
+    if (scenario === 'approval') worker.rpc.emit('approval', { id: 1, method: 'item/commandExecution/requestApproval', params: { threadId: thread.id } });
+    if (scenario === 'input') worker.rpc.emit('notification', { method: 'thread/status/changed', params: { threadId: thread.id, status: { type: 'active', activeFlags: ['waitingOnUserInput'] } } });
+    if (scenario === 'unknown') worker.rpc.emit('notification', { method: 'thread/status/changed', params: { threadId: thread.id, status: { type: 'notLoaded' } } });
+    if (scenario === 'unsupported') worker.rpc.emit('unsupported');
+    if (scenario === 'child' || scenario === 'sub-agent') {
+      f.threads.set('child', { id: 'child', cwd: '/a', status: { type: 'active' }, turns: [] });
+      f.threads.get(thread.id).turns.push({ id: 'completed-root', status: 'completed', items: [scenario === 'child' ? { id: 'spawn', type: 'collabAgentToolCall', status: 'completed', receiverThreadIds: ['child'] } : { id: 'spawn', type: 'subAgentActivity', kind: 'started', agentThreadId: 'child' }] });
+    }
+    f.advance(2 * 60 * 60 * 1000); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []); assert.equal(f.commands.some(args => args[0] === 'kill-pane'), false);
+  });
+});
+
+test('old worker lifecycle is explicitly unknown and no new cleanup opcode is sent', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
+  const connection = [...rpc.runs.values()][0].connection, call = connection.call.bind(connection);
+  connection.call = async (op, params) => { assert.notEqual(op, 'prepareIdleStop'); const result = await call(op, params); if (op === 'hello') delete result.lifecycle; return result; };
+  f.advance(3 * 60 * 60 * 1000); assert.equal((await rpc.listRuns())[0].lifecycle.reason, 'worker_upgrade_required'); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+});
+
+test('freeze and a changed process identity prevent stop even after the idle deadline', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' });
+  f.advance(2 * 60 * 60 * 1000); await rpc.freezeThreads([thread.id], 'archive-op');
+  assert.equal((await cleanupFor(rpc, f).maintenance())[0].reason, 'thread_frozen'); assert.equal(f.commands.some(args => args[0] === 'kill-pane'), false);
+  await rpc.releaseThreads([thread.id], 'archive-op'); const row = (await rpc.listRuns())[0];
+  f.linux.processes.get(row.pid).startTicks = 'reused'; await assert.rejects(rpc.reapRun(row.id, row.revision), { code: 'runtime_changed' });
+  assert.equal(f.commands.some(args => args[0] === 'kill-pane'), false);
+});
+
+test('new turn admitted before cleanup wins, and no turn dispatch can cross sealed cleanup admission', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }); f.advance(2 * 60 * 60 * 1000);
+  const old = (await rpc.listRuns())[0]; await rpc.call('turn/start', { threadId: thread.id, input: [] });
+  await assert.rejects(rpc.reapRun(old.id, old.revision), { code: 'runtime_changed' }); assert.equal(f.commands.some(args => args[0] === 'kill-pane'), false);
+  const worker = [...f.workers.values()][0], saved = f.threads.get(thread.id).turns.at(-1); saved.status = 'completed';
+  worker.rpc.emit('notification', { method: 'turn/completed', params: { threadId: thread.id, turn: saved } }); await rpc.listRuns(); f.advance(2 * 60 * 60 * 1000);
+  const row = (await rpc.listRuns())[0], original = f.platform.cleanupIdentity;
+  let task, checks = 0;
+  f.platform.cleanupIdentity = async receipt => { const result = await original(receipt); if (++checks === 2) { task = worker.instance.request({ op: 'rpc', method: 'turn/start', params: { threadId: thread.id, input: [] } }).catch(error => error); } return result; };
+  const before = worker.rpc.calls.filter(call => call.method === 'turn/start').length;
+  assert.equal((await rpc.reapRun(row.id, row.revision)).stopped, true); await task;
+  assert.equal(worker.rpc.calls.filter(call => call.method === 'turn/start').length, before);
+});
+
+test('native project methods use metadata RPC and nullable projectId survives worker launch', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start();
+  const libraryCall = rpc.library.call.bind(rpc.library); rpc.library.call = async (method, params) => method.startsWith('project/') || ['thread/name/set', 'thread/metadata/update', 'thread/section/move', 'threadSection/list'].includes(method) ? { method, params } : libraryCall(method, params);
+  for (const method of ['project/list', 'project/read', 'project/create', 'project/update', 'thread/name/set', 'thread/metadata/update', 'thread/section/move', 'threadSection/list']) assert.equal((await rpc.call(method, { id: 'metadata' })).method, method);
+  await rpc.call('thread/start', { cwd: '/a', projectId: null, approvalPolicy: 'on-request', sandbox: 'workspace-write' });
+  const first = [...f.workers.values()][0].rpc.calls[0]; assert.equal(first.params.projectId, null); assert.equal(first.params.approvalPolicy, 'on-request'); assert.equal(first.params.sandbox, 'workspace-write');
+});
+
+test('crash cleanup reconciles only a proven absent own runtime and preserves stale surviving panes', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' });
+  const row = (await rpc.listRuns())[0], receipt = await f.platform.readReceipt(row.id);
+  f.linux.processes.delete(receipt.worker.pid); f.linux.processes.delete(receipt.codex.pid);
+  // A surviving or unknown pane is retained even if both original PIDs died.
+  assert.deepEqual(await rpc.cleanupStaleRuns(), []); assert.equal((await f.platform.readReceipt(row.id)).closed, false);
+  f.sessions.delete(receipt.tmux.sessionId);
+  const result = await rpc.cleanupStaleRuns(); assert.equal(result[0].reason, 'already_absent'); assert.equal(result[0].id, row.id); assert.equal(result[0].threadId, thread.id); assert.equal((await f.platform.readReceipt(row.id)).closed, true);
+  assert.equal(f.threads.get(thread.id).id, thread.id); assert.equal(f.commands.some(args => args[0] === 'kill-pane' || args[0] === 'kill-session' || args[0] === 'kill-server'), false);
+});
+
+test('human attachment protects while connected but does not change the last-output clock', async t => {
+  const settings = {}, f = await fixture(t, settings), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
+  f.advance(2 * 60 * 60 * 1000); settings.attached = 1; assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  f.advance(60 * 60 * 1000); settings.attached = 0; assert.equal((await rpc.listRuns())[0].lifecycle.lastOutputAt, 1000);
+  assert.equal((await cleanupFor(rpc, f).maintenance())[0].stopped, true);
+});
+
+test('unknown process enumeration and malformed preferences preserve the managed runtime', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }); f.advance(2 * 60 * 60 * 1000);
+  const readdir = f.linux.readdir.bind(f.linux); f.linux.readdir = async path => { if (path === '/proc') throw errno('EACCES'); return readdir(path); };
+  assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []); assert.equal((await rpc.listRuns()).length, 1);
+  f.linux.readdir = readdir; await f.platform.writeJSON(join(f.root, 'runtime', 'thread-preferences', `${thread.id}.json`), { schemaVersion: 9, threadId: thread.id });
+  const row = (await rpc.listRuns())[0]; assert.equal(row.managed, true); assert.equal(row.keepRunning, true); assert.equal(row.lifecycle.reason, 'runtime_preference_unknown');
+  assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []); assert.equal(f.commands.some(args => args[0] === 'kill-pane'), false);
+});
+
+test('tmux attachment arriving at the final stop is atomically refused and the worker admits future work', async t => {
+  const settings = { attachAtStop: true }, f = await fixture(t, settings), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }); f.advance(2 * 60 * 60 * 1000);
+  const row = (await rpc.listRuns())[0]; await assert.rejects(rpc.reapRun(row.id, row.revision), { code: 'runtime_changed' });
+  assert.equal((await rpc.listRuns()).length, 1); assert.equal(f.commands.some(args => args[0] === 'kill-pane'), false);
+  assert.ok((await rpc.call('turn/start', { threadId: thread.id, input: [] })).turn.id);
+});
+
+test('unrelated same-UID exe or cmdline denial retains verified relation data and permits cleanup', async t => {
+  for (const denied of ['exe', 'cmdline']) await t.test(denied, async t => {
+    const f = await fixture(t), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
+    f.linux.processes.set(999, { pid: 999, ppid: 1, startTicks: '9990', executable: '/unreadable/process', commandline: ['/unreadable/process'] });
+    const read = f.linux.readFile.bind(f.linux), link = f.linux.readlink.bind(f.linux);
+    if (denied === 'exe') f.linux.readlink = async path => { if (path === '/proc/999/exe') throw errno('EACCES'); return link(path); };
+    else f.linux.readFile = async (path, encoding) => { if (path === '/proc/999/cmdline') throw errno('EPERM'); return read(path, encoding); };
+    const relation = (await f.platform.processes()).find(process => process.pid === 999);
+    assert.equal(relation.identityUnavailable, true); assert.equal(relation.ppid, 1); assert.equal(relation.sid, 999); assert.equal(relation.startTicks, '9990'); assert.equal(relation.executable, undefined);
+    await assert.rejects(f.platform.getProcess(999), { code: denied === 'exe' ? 'EACCES' : 'EPERM' });
+    f.advance(2 * 60 * 60 * 1000); assert.equal((await cleanupFor(rpc, f).maintenance())[0].stopped, true); assert.ok(f.linux.processes.has(999));
+  });
+});
+
+test('unreadable identities in the process subtree, session or tty still block cleanup', async t => {
+  for (const association of ['child', 'session', 'tty']) await t.test(association, async t => {
+    const f = await fixture(t, { tty: 123 }), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
+    const row = (await rpc.listRuns())[0], receipt = await f.platform.readReceipt(row.id);
+    f.linux.processes.set(999, { pid: 999, ppid: association === 'child' ? receipt.codex.pid : 1, sid: association === 'session' ? receipt.worker.sid : 999, tty: association === 'tty' ? 123 : 0, startTicks: '9990', executable: '/unreadable/process', commandline: ['/unreadable/process'] });
+    const link = f.linux.readlink.bind(f.linux); f.linux.readlink = async path => { if (path === '/proc/999/exe') throw errno('EACCES'); return link(path); };
+    f.advance(2 * 60 * 60 * 1000); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []); assert.equal((await rpc.listRuns())[0].lifecycle.reason, 'runtime_child_process');
+    assert.equal(f.commands.some(args => args[0] === 'if-shell'), false);
+  });
+});
+
+test('stat denial or relation changes for a non-dumpable process remain unknown and block cleanup', async t => {
+  for (const scenario of ['stat-denial', 'reparented']) await t.test(scenario, async t => {
+    const f = await fixture(t), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
+    f.linux.processes.set(999, { pid: 999, ppid: 1, startTicks: '9990', executable: '/unreadable/process', commandline: ['/unreadable/process'] });
+    const read = f.linux.readFile.bind(f.linux), link = f.linux.readlink.bind(f.linux);
+    f.linux.readlink = async path => { if (path === '/proc/999/exe') { if (scenario === 'reparented') f.linux.processes.get(999).ppid = 2; throw errno('EACCES'); } return link(path); };
+    if (scenario === 'stat-denial') f.linux.readFile = async (path, encoding) => { if (path === '/proc/999/stat') throw errno('EACCES'); return read(path, encoding); };
+    await assert.rejects(f.platform.processes(), { code: scenario === 'stat-denial' ? 'EACCES' : 'runtime_identity' });
+    assert.equal(f.commands.some(args => args[0] === 'if-shell'), false);
+  });
+});
+
+test('actual output advances the two-hour cutoff while hello, history and metadata do not', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }), worker = [...f.workers.values()][0];
+  const original = (await rpc.listRuns())[0].lifecycle.lastOutputAt;
+  f.advance(60 * 60 * 1000);
+  await rpc.listRuns(); await rpc.call('thread/read', { threadId: thread.id, includeTurns: true });
+  worker.rpc.emit('notification', { method: 'thread/name/updated', params: { threadId: thread.id, name: 'metadata only' } });
+  worker.rpc.emit('notification', { method: 'thread/status/changed', params: { threadId: thread.id, status: { type: 'idle' } } });
+  worker.rpc.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: thread.id, delta: '' } });
+  await rpc.setWebPresence('a'.repeat(64), thread.id); await rpc.releaseWebPresence('a'.repeat(64));
+  assert.equal((await rpc.listRuns())[0].lifecycle.lastOutputAt, original);
+  f.advance(60 * 60 * 1000 - 1);
+  worker.rpc.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: thread.id, delta: 'new output' } });
+  const outputAt = f.clock(); assert.equal((await rpc.listRuns())[0].lifecycle.lastOutputAt, outputAt);
+  f.advance(1); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  f.advance(2 * 60 * 60 * 1000 - 2); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  f.advance(1); assert.equal((await cleanupFor(rpc, f).maintenance())[0].stopped, true);
+});
+
+test('long-running work remains protected and completion starts a fresh output window', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }), worker = [...f.workers.values()][0];
+  const { turn } = await rpc.call('turn/start', { threadId: thread.id, input: [] });
+  f.advance(3 * 60 * 60 * 1000); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  worker.rpc.emit('notification', { method: 'item/commandExecution/outputDelta', params: { threadId: thread.id, delta: 'still running' } });
+  assert.equal((await rpc.listRuns())[0].lifecycle.lastOutputAt, f.clock());
+  f.threads.get(thread.id).turns.at(-1).status = 'completed';
+  worker.rpc.emit('notification', { method: 'turn/completed', params: { threadId: thread.id, turn: { id: turn.id, status: 'completed' } } });
+  assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  f.advance(2 * 60 * 60 * 1000); assert.equal((await cleanupFor(rpc, f).maintenance())[0].stopped, true);
+});
+
+test('web presence protects an old quiet conversation and expires without changing its output clock', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' });
+  const original = (await rpc.listRuns())[0].lifecycle.lastOutputAt; f.advance(2 * 60 * 60 * 1000);
+  assert.deepEqual(await rpc.setWebPresence('a'.repeat(64), thread.id), { threadId: thread.id, connected: true, leaseMs: 90000 });
+  const connected = (await rpc.listRuns())[0]; assert.equal(connected.webConnected, true); assert.equal(connected.lifecycle.lastOutputAt, original);
+  assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  f.advance(89999); assert.equal((await rpc.getWebPresence(thread.id)).connected, true); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  f.advance(1); assert.equal((await rpc.getWebPresence(thread.id)).connected, false); assert.equal((await cleanupFor(rpc, f).maintenance())[0].stopped, true);
+});
+
+test('multiple tab leases survive gateway restart and any renewed live lease protects the conversation', async t => {
+  const f = await fixture(t), first = f.manager(); await first.start(); const { thread } = await first.call('thread/start', { cwd: '/a' }); f.advance(2 * 60 * 60 * 1000);
+  await first.setWebPresence('a'.repeat(64), thread.id); await first.setWebPresence('b'.repeat(64), thread.id); first.close();
+  const second = f.manager(); await second.start(); assert.equal((await second.getWebPresence(thread.id)).connected, true);
+  await second.releaseWebPresence('a'.repeat(64)); assert.equal((await second.getWebPresence(thread.id)).connected, true);
+  f.advance(30000); await second.setWebPresence('b'.repeat(64), thread.id);
+  f.advance(60001); assert.deepEqual(await cleanupFor(second, f).maintenance(), []);
+  f.advance(29999); assert.equal((await second.getWebPresence(thread.id)).connected, false); assert.equal((await cleanupFor(second, f).maintenance())[0].stopped, true);
+});
+
+test('switching one tab releases only its former conversation and never another tab lease', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const a = (await rpc.call('thread/start', { cwd: '/a' })).thread, b = (await rpc.call('thread/start', { cwd: '/b' })).thread;
+  await rpc.setWebPresence('a'.repeat(64), a.id); await rpc.setWebPresence('b'.repeat(64), a.id); await rpc.setWebPresence('a'.repeat(64), b.id);
+  assert.equal((await rpc.getWebPresence(a.id)).connected, true); assert.equal((await rpc.getWebPresence(b.id)).connected, true);
+  await rpc.releaseWebPresence('b'.repeat(64)); assert.equal((await rpc.getWebPresence(a.id)).connected, false); assert.equal((await rpc.getWebPresence(b.id)).connected, true);
+});
+
+test('a late registered browser lease defeats a stale cleanup preview before stopping', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }); f.advance(2 * 60 * 60 * 1000);
+  const eligible = (await rpc.listRuns())[0]; await rpc.setWebPresence('a'.repeat(64), thread.id);
+  await assert.rejects(rpc.reapRun(eligible.id, eligible.revision), { code: 'runtime_web_connected' });
+  assert.equal(f.commands.some(args => args[0] === 'if-shell'), false); assert.equal((await rpc.listRuns()).length, 1);
+});
+
+test('presence admission cannot acknowledge a connection while an already sealed cleanup is stopping', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }); f.advance(2 * 60 * 60 * 1000);
+  const row = (await rpc.listRuns())[0], inspect = f.platform.cleanupIdentity, stop = f.platform.stop;
+  let registered = false, registration, checks = 0;
+  f.platform.cleanupIdentity = async receipt => { const result = await inspect(receipt); if (++checks === 2) registration = rpc.setWebPresence('a'.repeat(64), thread.id).then(value => { registered = true; return value; }); return result; };
+  f.platform.stop = async (...args) => { assert.equal(registered, false); return stop.apply(f.platform, args); };
+  assert.equal((await rpc.reapRun(row.id, row.revision)).stopped, true); assert.equal((await registration).connected, true);
+  assert.equal(f.threads.get(thread.id).id, thread.id); assert.equal((await rpc.listRuns()).length, 0);
+});
+
+test('new output arriving after the worker is sealed cancels cleanup and admits future work', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }); f.advance(2 * 60 * 60 * 1000);
+  const row = (await rpc.listRuns())[0], inspect = f.platform.cleanupIdentity, worker = [...f.workers.values()][0]; let checks = 0;
+  f.platform.cleanupIdentity = async receipt => { const result = await inspect(receipt); if (++checks === 2) worker.rpc.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: thread.id, delta: 'late output' } }); return result; };
+  await assert.rejects(rpc.reapRun(row.id, row.revision), { code: 'runtime_changed' }); assert.equal(f.commands.some(args => args[0] === 'if-shell'), false);
+  assert.ok((await rpc.call('turn/start', { threadId: thread.id, input: [] })).turn.id);
+});
+
+test('v1 worker lifecycle and missing last-output evidence are never reaped', async t => {
+  for (const version of ['v1', 'missing-output']) await t.test(version, async t => {
+    const f = await fixture(t), rpc = f.manager(); await rpc.start(); await rpc.call('thread/start', { cwd: '/a' });
+    const connection = [...rpc.runs.values()][0].connection, call = connection.call.bind(connection);
+    connection.call = async (op, params) => { assert.notEqual(op, 'prepareIdleStop'); const result = await call(op, params); if (op === 'hello') { if (version === 'v1') result.lifecycle.version = 1; else delete result.lifecycle.lastOutputAt; } return result; };
+    f.advance(3 * 60 * 60 * 1000); assert.equal((await rpc.listRuns())[0].lifecycle.reason, 'worker_upgrade_required'); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  });
+});
+
+test('presence storage is bounded, prunes expired leases, and corrupt records protect managed runs', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' }), path = join(f.root, 'runtime', 'web-presence.json');
+  const leases = Array.from({ length: 1000 }, (_, i) => ({ clientId: i.toString(16).padStart(64, '0'), threadId: thread.id, expiresAt: f.clock() + 90000 }));
+  await f.platform.writeJSON(path, { schemaVersion: 1, leases });
+  await assert.rejects(rpc.setWebPresence('f'.repeat(64), thread.id), { code: 'runtime_presence_limit' });
+  f.advance(90000); await rpc.setWebPresence('f'.repeat(64), thread.id); assert.equal((await f.platform.readJSON(path)).leases.length, 1);
+  assert.equal((await f.linux.lstat(path)).mode & 0o777, 0o600);
+  await f.platform.writeJSON(path, { schemaVersion: 1, leases: [{ clientId: 'unverified', threadId: thread.id, expiresAt: f.clock() + 90000 }] });
+  f.advance(2 * 60 * 60 * 1000); const row = (await rpc.listRuns())[0]; assert.equal(row.webConnected, true); assert.equal(row.lifecycle.reason, 'runtime_presence_unknown'); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+});
+
+test('child output discovered only through history starts a fresh cutoff without treating repeated reads as output', async t => {
+  const f = await fixture(t), rpc = f.manager(); await rpc.start(); const { thread } = await rpc.call('thread/start', { cwd: '/a' });
+  const child = { id: 'quiet-child', cwd: '/a', status: { type: 'active' }, turns: [{ id: 'child-turn', status: 'inProgress', items: [] }] };
+  f.threads.set(child.id, child);
+  f.threads.get(thread.id).turns.push({ id: 'parent-turn', status: 'completed', items: [{ id: 'spawn', type: 'collabAgentToolCall', status: 'completed', receiverThreadIds: [child.id] }] });
+  assert.equal((await rpc.listRuns())[0].lifecycle.reason, 'runtime_not_idle');
+  f.advance(3 * 60 * 60 * 1000); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  // No child notification is emitted. A completed saved turn is the evidence.
+  child.status = { type: 'idle' }; child.turns[0].status = 'completed'; child.turns[0].items.push({ id: 'answer', type: 'agentMessage', text: 'just completed' });
+  const completedAt = f.clock(); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []); assert.equal((await rpc.listRuns())[0].lifecycle.lastOutputAt, completedAt);
+  f.advance(60 * 60 * 1000); child.name = 'metadata only'; child.projectId = 'metadata-project';
+  assert.equal((await rpc.listRuns())[0].lifecycle.lastOutputAt, completedAt); assert.deepEqual(await cleanupFor(rpc, f).maintenance(), []);
+  f.advance(60 * 60 * 1000); assert.equal((await cleanupFor(rpc, f).maintenance())[0].stopped, true);
 });

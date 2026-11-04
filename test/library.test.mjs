@@ -38,7 +38,7 @@ function fixture(initial = [thread('root'), child('child', 'root')], options = {
     for (const id of ids) rows.get(id).archived = true;
     return {};
   } };
-  const service = createArchiveService({ rpc, clock: () => time, authoritativeDescendants: options.authoritativeDescendants || false, storeFile: options.storeFile || null, filesystem: options.filesystem,
+  const service = createArchiveService({ rpc, clock: () => time, authoritativeDescendants: options.authoritativeDescendants || false, storeFile: options.storeFile || null, filesystem: options.filesystem, inspectThreadStates: options.inspectThreadStates, atomicity: options.atomicity,
     async releaseFrozenThreads(ids, opId) { phases.push('releaseRestored'); releasedCount++; await options.releaseRestored?.(ids, opId); for (const id of ids) freezes.delete(id); },
     async inspectWriters(ids) { phases.push('inspect'); return options.inspect ? options.inspect(ids, observation) : observation; },
     async freezeThreads(ids, opId) {
@@ -74,13 +74,43 @@ test('preview lists the complete spawn cascade across active and archived pages,
   assert.equal(preview.affected.find(row => row.id === 'a').writers[0].runId, 'run-a');
   assert.equal(f.archiveCount, 0); assert.equal(f.stoppedCount, 0); assert.equal(f.freezes.size, 0);
   assert.ok(f.calls.length >= 3, 'active and archived pages must both be consumed');
-  for (const call of f.calls) { assert.equal(call.method, 'thread/list'); assert.deepEqual(call.params.sourceKinds, THREAD_SOURCE_KINDS); assert.equal('cwd' in call.params, false); }
+  for (const call of f.calls) { assert.equal(call.method, 'thread/list'); assert.deepEqual(call.params.sourceKinds, THREAD_SOURCE_KINDS); assert.equal('cwd' in call.params, false); assert.equal('useStateDbOnly' in call.params, false); }
+});
+
+test('authoritative archive inventory and ancestor queries both use the native state DB without weakening duplicate checks', async () => {
+  const f = fixture(undefined, { authoritativeDescendants: true, list(params, result) {
+    // Scan-and-repair listing can repeat a row already returned from the DB.
+    return params.useStateDbOnly ? result : { ...result, data: [...result.data, result.data[0]].filter(Boolean) };
+  } });
+  const preview = await f.service.preview('root', owner); assert.equal(preview.canArchive, true);
+  assert.ok(f.calls.some(call => call.method === 'thread/list' && !call.params.ancestorThreadId)); assert.ok(f.calls.some(call => call.params.ancestorThreadId === 'root'));
+  const result = await f.service.execute(preview.planId, owner); assert.equal(result.status, 'complete');
+  for (const call of f.calls.filter(call => call.method === 'thread/list')) assert.equal(call.params.useStateDbOnly, true);
+  const conflicting = fixture(undefined, { authoritativeDescendants: true, list(params, result) { return result.data.length ? { ...result, data: [...result.data, result.data[0]] } : result; } });
+  const blocked = await conflicting.service.preview('root', owner); assert.equal(blocked.canArchive, false); assert.equal(blocked.blockedReasons[0].code, 'archive_inventory_changed'); assert.equal(conflicting.archiveCount, 0);
 });
 test('authoritative null parent establishes custom-source roots without inventing unrelated descendants', async () => {
   const f = fixture([thread('root', { source: { custom: 'phone-client' } }), child('child', 'root'), thread('unrelated', { source: 'unknown' })]);
   const preview = await f.service.preview('root', owner);
   assert.equal(preview.canArchive, true); assert.deepEqual(preview.affected.map(row => row.id).sort(), ['child', 'root']);
   const result = await f.service.execute(preview.planId, owner); assert.equal(result.status, 'complete'); assert.equal(f.rows.get('unrelated').archived, false);
+});
+
+test('shared unknown receipts restore gateway admission freezes after reconstruction and recheck remains read only', async t => {
+  const storeFile = await store(t), inspectThreadStates = async ids => ({ complete: true, states: ids.map(threadId => ({ threadId, status: 'notLoaded', fingerprint: 'a'.repeat(64) })) });
+  const options = { storeFile, authoritativeDescendants: true, atomicity: 'gateway-admission-only', inspectThreadStates };
+  const first = fixture(undefined, { ...options, archive() { throw new RelayError(504, 'rpc_timeout', 'Unknown archive outcome'); } });
+  const preview = await first.service.preview('root', owner), result = await first.service.execute(preview.planId, owner);
+  assert.equal(result.status, 'unknown'); assert.equal(result.freezeRetained, true); assert.equal(await first.service.isFrozen('child'), true);
+  let dispatched = false;
+  await assert.rejects(first.service.admit('child', () => { dispatched = true; }), { code: 'thread_frozen' }); assert.equal(dispatched, false);
+  const restored = fixture([...first.rows.values()], options); await restored.service.ready;
+  assert.equal(await restored.service.isFrozen('root'), true); assert.equal(await restored.service.isFrozen('child'), true);
+  await assert.rejects(restored.service.admit('root', () => { dispatched = true; }), { code: 'thread_frozen' }); assert.equal(dispatched, false); assert.equal(restored.archiveCount, 0);
+  for (const row of restored.rows.values()) row.archived = true;
+  const checked = await restored.service.recheck(result.operationId, owner);
+  assert.equal(checked.status, 'complete'); assert.equal(checked.atomicity, 'gateway-admission-only'); assert.equal(checked.freezeRetained, false); assert.equal(restored.archiveCount, 0);
+  assert.equal(await restored.service.isFrozen('root'), false); assert.equal(await restored.service.admit('root', () => 'allowed'), 'allowed');
 });
 
 test('execute freezes the confirmed set, stops and verifies managed writers, rechecks the scope, archives once and verifies every ID', async () => {

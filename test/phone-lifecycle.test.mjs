@@ -9,7 +9,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
 const response = body => ({ ok: true, status: 200, json: async () => body });
 
-function fixture(t, { bearer = true } = {}) {
+function fixture(t, { bearer = true, presence = false } = {}) {
   const nodes = new Map(), documentListeners = new Map(), timers = new Map(), sources = [], requests = [], polls = [];
   const turn = deferred(), sessionRead = deferred(); let timerId = 0;
   const node = () => ({ hidden: false, disabled: false, value: '', textContent: '', children: [], dataset: {}, listeners: new Map(), scrollHeight: 0, scrollTop: 0, clientHeight: 0,
@@ -29,6 +29,7 @@ function fixture(t, { bearer = true } = {}) {
     setTimeout(fn, ms) { timers.set(++timerId, { fn, ms }); return timerId; }, clearTimeout(id) { timers.delete(id); },
     fetch(url, options) {
       requests.push({ url, options });
+      if (url === '/api/runtime-presence') { const body = JSON.parse(options.body); return Promise.resolve(response({ ...body, connected: !!body.threadId, leaseMs: 90000 })); }
       if (url === '/api/turns') return turn.promise;
       if (url === '/api/session') return sessionRead.promise;
       if (url.startsWith('/api/poll?')) {
@@ -41,7 +42,7 @@ function fixture(t, { bearer = true } = {}) {
     } });
   vm.runInContext(source, context);
   const run = code => vm.runInContext(code, context);
-  run(`state.session = { authenticated: true, mode: 'production', csrf: 'fixture-csrf', ${bearer ? "authTransport: 'bearer', eventTransport: 'poll'," : ''} projects: [{ id: 'acceptance', name: 'Acceptance', cwd: '/isolated' }], pendingApprovals: [] }; state.projectId = 'acceptance'; state.thread = { id: 'thread-1', turns: [] }; state.upstreamStatus = 'connected'; state.connected = true; state.eventCursor = 7; $('prompt').value = 'single fixture turn'; controls();`);
+  run(`state.session = { authenticated: true, mode: 'production', csrf: 'fixture-csrf', ${bearer ? "authTransport: 'bearer', eventTransport: 'poll'," : ''} projects: [{ id: 'acceptance', name: 'Acceptance', cwd: '/isolated' }], pendingApprovals: [] }; state.projectId = 'acceptance'; state.thread = { id: 'thread-1', turns: [] }; state.upstreamStatus = 'connected'; state.connected = true; state.eventCursor = 7; ${presence ? "state.view = 'chat'; state.session.capabilities = { runtimePresence: true };" : ''} $('prompt').value = 'single fixture turn'; controls();`);
   t.after(async () => { run('stopSubscription()'); await flush(); });
   const visibility = async value => { document.visibilityState = value; documentListeners.get('visibilitychange')(); await flush(); };
   const submit = async () => { nodes.get('composer').listeners.get('submit')({ preventDefault() {} }); await flush(); };
@@ -99,4 +100,15 @@ test('normal foreground recovery still uses the existing hydrate deduplication',
   const f = fixture(t); f.run('subscribe()'); await f.visibility('hidden'); await f.visibility('visible'); await f.visibility('visible');
   assert.equal(f.run('state.posting'), false); assert.equal(f.requests.filter(request => request.url === '/api/session').length, 1);
   assert.equal(f.polls.length, 1); assert.equal(f.polls[0].options.signal.aborted, true); assert.equal(f.turnRequests().length, 0);
+});
+
+
+test('a pending mobile turn releases presence in background and renews its same chat on foreground without a duplicate turn', async t => {
+  const f = fixture(t, { presence: true }); f.run('subscribe()'); await f.run('runtimePresence.queue');
+  const presence = () => f.requests.filter(request => request.url === '/api/runtime-presence').map(request => ({ ...request, body: JSON.parse(request.options.body) }));
+  assert.equal(presence().at(-1).body.threadId, 'thread-1');
+  await f.submit(); await f.visibility('hidden'); await f.run('runtimePresence.queue'); assert.equal(presence().at(-1).body.threadId, null);
+  await f.visibility('visible'); await f.run('runtimePresence.queue'); assert.equal(presence().at(-1).body.threadId, 'thread-1'); assert.equal(new Set(presence().map(request => request.body.clientId)).size, 1);
+  assert.ok(presence().every(request => request.options.keepalive && request.options.headers.Authorization === `Bearer ${'a'.repeat(43)}`)); assert.equal(f.turnRequests().length, 1);
+  await f.finishTurn(); assert.equal(f.turnRequests().length, 1);
 });

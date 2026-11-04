@@ -13,7 +13,7 @@ import { createRelay, validateConfig } from '../src/server.mjs';
 
 const exec = promisify(execFile), tempRoot = resolve(tmpdir());
 const project = { id: 'home', name: 'Test only', cwd: '/workspace' };
-const production = { projects: [project], transport: 'local', remoteCodex: '/home/demo/.local/bin/codex', publicOrigin: 'https://relay.test.example', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
+const production = { projects: [project], transport: 'local', remoteCodex: '/opt/codex/bin/codex', publicOrigin: 'https://relay.test.example', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
 const env = { RELAY_ACCESS_SECRET: 'TEST_ONLY_NEVER_FOR_DEPLOYMENT_1234567890', RELAY_VERIFIED_PROTOCOL: '0.165.0' };
 let files;
 
@@ -33,7 +33,7 @@ async function installedOpenSsl() {
   throw new Error('TLS tests require an already installed OpenSSL; no tools were downloaded.');
 }
 before(async () => {
-  const dir = await mkdtemp(join(tempRoot, 'codex-ssh-webui-TEST_ONLY-tls-'));
+  const dir = await mkdtemp(join(tempRoot, 'codex-mobile-relay-TEST_ONLY-tls-'));
   files = { dir, keyFile: join(dir, 'TEST_ONLY-key.pem'), certFile: join(dir, 'TEST_ONLY-cert.pem'), invalidFile: join(dir, 'TEST_ONLY-invalid.pem') };
   const openssl = await installedOpenSsl();
   const opensslConfig = join(dir, 'TEST_ONLY-openssl.cnf'); await writeFile(opensslConfig, '[req]\ndistinguished_name=dn\n[dn]\n');

@@ -133,14 +133,15 @@ export function rolloutActivity(head, tail) {
   let meta;
   try { const first = JSON.parse(head.split('\n')[0]); if (first.type === 'session_meta') meta = first.payload; } catch { return null; }
   if (!meta || !/^[A-Za-z0-9_-]{1,160}$/.test(meta.id || '') || typeof meta.cwd !== 'string' || !meta.cwd.startsWith('/')) return null;
-  let status = 'unknown';
+  let status = 'unknown', cwd = meta.cwd;
   for (const line of tail.split('\n')) {
     let event; try { event = JSON.parse(line); } catch { continue; }
+    if (event.type === 'turn_context' && typeof event.payload?.cwd === 'string' && event.payload.cwd.startsWith('/') && event.payload.cwd.length <= 4096) cwd = event.payload.cwd;
     if (event.type !== 'event_msg') continue;
     if (['task_started', 'turn_started'].includes(event.payload?.type)) status = 'working';
     if (['task_complete', 'task_completed', 'turn_complete', 'turn_aborted'].includes(event.payload?.type)) status = 'idle';
   }
-  return { threadId: meta.id, cwd: meta.cwd.slice(0, 4096), status };
+  return { threadId: meta.id, cwd: cwd.slice(0, 4096), status };
 }
 
 async function readRollout(path) {
@@ -216,7 +217,7 @@ export function createOverviewCollector({ config, rpc, authorizedThreads, loaded
   let previousCpu = cpuTicks(), previousTime = clock(), cache, pending;
   const metrics = sampleMetrics || (async () => {
     const errors = [], result = { cpu: null, memory: null, storage: [], gpus: [], errors };
-    if (mock) return { cpu: { percent: 18.4, cores: 32, load: [2.1, 1.8, 1.5] }, memory: { totalBytes: 274877906944, usedBytes: 68719476736, availableBytes: 206158430208, percent: 25 }, storage: [{ path: '/srv/storage', totalBytes: 16000000000000, usedBytes: 2400000000000, availableBytes: 13600000000000, percent: 15 }], gpus: [{ index: 0, name: '模拟 GPU', utilizationPercent: 32, memoryTotalBytes: 25769803776, memoryUsedBytes: 6442450944, temperatureC: 46 }], errors: [], simulated: true };
+    if (mock) return { cpu: { percent: 18.4, cores: 32, load: [2.1, 1.8, 1.5] }, memory: { totalBytes: 274877906944, usedBytes: 68719476736, availableBytes: 206158430208, percent: 25 }, storage: [{ path: '/storage/data', totalBytes: 16000000000000, usedBytes: 2400000000000, availableBytes: 13600000000000, percent: 15 }], gpus: [{ index: 0, name: '模拟 GPU', utilizationPercent: 32, memoryTotalBytes: 25769803776, memoryUsedBytes: 6442450944, temperatureC: 46 }], errors: [], simulated: true };
     if (clock() - previousTime < 150) await delay(150);
     const currentCpu = cpuTicks(), difference = currentCpu.total - previousCpu.total;
     result.cpu = { percent: difference > 0 ? percent(difference - (currentCpu.idle - previousCpu.idle), difference) : null, cores: os.cpus().length, load: os.loadavg().map(value => Math.round(value * 100) / 100) };

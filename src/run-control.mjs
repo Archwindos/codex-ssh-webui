@@ -1,7 +1,9 @@
 import * as fs from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { basename, join } from 'node:path';
-import { observeCodexProcesses, parseTmuxPanes } from './overview.mjs';
+import { observeCodexProcesses } from './overview.mjs';
 import { createRuntimePlatform } from './runtimes.mjs';
 import { fail } from './protocol.mjs';
 
@@ -12,46 +14,53 @@ const copy = value => JSON.parse(JSON.stringify(value));
 const rank = { working: 0, waitingApproval: 1, idle: 2, unknown: 3 };
 const status = value => Object.hasOwn(rank, value) ? value : 'unknown';
 const pair = row => `${row.threadId}:${row.pid}`;
-const paneFormat = '#{session_id}|#{session_name}|#{window_index}|#{pane_index}|#{pane_id}|#{pane_pid}';
 const publicTmux = value => value && ({ sessionId: value.sessionId, sessionName: value.sessionName, windowIndex: value.windowIndex, paneIndex: value.paneIndex, paneId: value.paneId, target: value.target });
+const stopProcesses = `import os,sys,json,signal,ctypes,platform
+if sys.platform!='linux': raise RuntimeError('Linux pidfds required')
+native_open=getattr(os,'pidfd_open',None); native_send=getattr(signal,'pidfd_send_signal',None)
+libc=None
+if native_open is None or native_send is None:
+ if platform.machine()!='x86_64': raise RuntimeError('Unsupported pidfd syscall architecture')
+ libc=ctypes.CDLL(None,use_errno=True); libc.syscall.restype=ctypes.c_long
+def syscall(number,*args):
+ value=libc.syscall(ctypes.c_long(number),*args)
+ if value<0: raise OSError(ctypes.get_errno(),'pidfd syscall failed')
+ return value
+def open_pidfd(pid):
+ return native_open(pid,0) if native_open else syscall(434,ctypes.c_int(pid),ctypes.c_uint(0))
+def terminate_pidfd(handle):
+ if native_send: native_send(handle,signal.SIGTERM)
+ else: syscall(424,ctypes.c_int(handle),ctypes.c_int(signal.SIGTERM),ctypes.c_void_p(),ctypes.c_uint(0))
+expected=json.loads(sys.argv[1]); handles=[]
+try:
+ for item in expected:
+  pid=item['pid']; handle=open_pidfd(pid); handles.append(handle)
+  prefix='/proc/'+str(pid)
+  stat=open(prefix+'/stat').read(); fields=stat[stat.rfind(')')+2:].split()
+  command=open(prefix+'/cmdline','rb').read()[:-1].decode().split('\\0')
+  if os.stat(prefix).st_uid!=os.getuid() or fields[19]!=item['startTicks'] or int(fields[1])!=item['ppid'] or os.readlink(prefix+'/exe')!=item['executable'] or command!=item['commandline']: raise RuntimeError('identity changed')
+ for handle in handles: terminate_pidfd(handle)
+ print('requested')
+finally:
+ for handle in handles: os.close(handle)
+`;
 
-// This platform is the only manual-runtime path that can invoke tmux. It never
-// reads pane output or forwards process environments/arguments to the browser.
+// Manual close signals only identity-checked Codex processes through pidfds.
+// It never invokes tmux or forwards process environments/arguments to browsers.
 export function createRunControlPlatform({ filesystem = fs, exec, uid = () => process.getuid(), env = process.env, system = process.platform } = {}) {
-  const base = createRuntimePlatform({ filesystem, ...(exec ? { exec } : {}), uid, env });
-  const snapshotKey = snapshot => hash({ server: snapshot.server, session: snapshot.session, panes: snapshot.panes, codex: snapshot.codex });
+  const execute = exec || promisify(execFile);
+  const base = createRuntimePlatform({ filesystem, exec: execute, uid, env });
+  const snapshotKey = snapshot => hash({ codex: snapshot.codex, processes: snapshot.processes });
   const capture = async row => {
-    if (system !== 'linux' || !pidOK(row.pid) || !/^\$\d+$/.test(row.tmux?.sessionId || '') || !/^%\d+$/.test(row.tmux?.paneId || '')) fail(409, 'runtime_identity', '运行身份不完整，不能关闭。');
-    const server = await base.serverState(null);
+    if (system !== 'linux' || !pidOK(row.pid)) fail(409, 'runtime_identity', '运行身份不完整，不能关闭。');
     const codex = await base.getProcess(row.pid);
     if (!codex || !/^codex(?: \(deleted\))?$/.test(basename(codex.executable))) fail(409, 'runtime_identity', 'Codex 进程身份无法核对。');
-    const environment = await filesystem.readFile(`/proc/${row.pid}/environ`);
-    if (environment.length > 65536) fail(409, 'runtime_identity', '运行环境身份不完整。');
-    const entries = environment.toString('utf8').split('\0'), tmuxValues = entries.filter(value => value.startsWith('TMUX=')), paneValues = entries.filter(value => value.startsWith('TMUX_PANE='));
-    const match = tmuxValues.length === 1 && /^TMUX=(\/[^,\0]{1,4096}),(\d+),(\d+)$/.exec(tmuxValues[0]);
-    if (!match || paneValues.length !== 1 || match[1] !== server.socket || Number(match[2]) !== server.serverPid || match[3] !== row.tmux.sessionId.slice(1) || paneValues[0] !== `TMUX_PANE=${row.tmux.paneId}`) fail(409, 'runtime_socket', '仅支持身份已核对的默认 tmux socket；不会猜测其他运行环境。');
-    const listed = await base.tmux(['list-panes', '-s', '-t', row.tmux.sessionId, '-F', paneFormat]);
-    const parsed = parseTmuxPanes(listed.stdout);
-    if (listed.code || listed.stderr || !parsed.length || parsed.length !== listed.stdout.split('\n').filter(Boolean).length || parsed.some(pane => pane.sessionId !== row.tmux.sessionId || pane.sessionName !== row.tmux.sessionName) || new Set(parsed.map(pane => pane.paneId)).size !== parsed.length) fail(409, 'runtime_identity', '整个 tmux 会话的窗格身份无法核对。');
-    const panes = [];
-    for (const pane of parsed) {
-      const process = await base.getProcess(pane.panePid);
-      if (!process) fail(409, 'runtime_identity', '窗格进程身份无法核对。');
-      panes.push({ ...pane, process: { pid: process.pid, startTicks: process.startTicks, executable: process.executable } });
-    }
-    const target = panes.find(pane => pane.paneId === row.tmux.paneId);
-    if (!target || target.target !== row.tmux.target) fail(409, 'runtime_identity', '目标窗格已改变。');
-    const chain = [], seen = new Set(); let current = codex;
-    while (current && chain.length < 64 && !seen.has(current.pid)) {
-      chain.push(current); seen.add(current.pid);
-      if (current.pid === target.panePid) break;
-      current = current.ppid > 1 ? await base.getProcess(current.ppid) : null;
-    }
-    if (chain.at(-1)?.pid !== target.panePid) fail(409, 'runtime_identity', 'Codex 与默认 tmux 窗格的进程关系无法核对。');
-    for (const process of chain) { const again = await base.getProcess(process.pid); if (!base.processMatches(process, again) || again.ppid !== process.ppid) fail(409, 'runtime_changed', '运行进程身份已改变，请重新预览。'); }
-    for (const pane of panes) { const again = await base.getProcess(pane.panePid); if (!again || again.startTicks !== pane.process.startTicks || again.executable !== pane.process.executable) fail(409, 'runtime_changed', '窗格进程身份已改变，请重新预览。'); }
-    await base.serverState(server);
-    return { row: copy(row), server, session: { id: row.tmux.sessionId, name: row.tmux.sessionName }, panes: panes.sort((a, b) => a.paneId.localeCompare(b.paneId)), codex: { pid: codex.pid, startTicks: codex.startTicks } };
+    const all = await base.processes(), subtree = new Set([codex.pid]);
+    for (let changed = true; changed;) { changed = false; for (const process of all) if (subtree.has(process.ppid) && !subtree.has(process.pid)) { subtree.add(process.pid); changed = true; } }
+    const targets = all.filter(process => subtree.has(process.pid)).sort((a, b) => a.pid - b.pid);
+    if (!targets.some(process => base.processMatches(codex, process))) fail(409, 'runtime_identity', 'Codex 进程子树无法安全核对。');
+    for (const process of targets) { const again = await base.getProcess(process.pid); if (!base.processMatches(process, again) || again.ppid !== process.ppid) fail(409, 'runtime_changed', '运行进程身份已改变，请重新预览。'); }
+    return { row: copy(row), panes: [], codex, processes: targets };
   };
   return {
     capture,
@@ -59,16 +68,17 @@ export function createRunControlPlatform({ filesystem = fs, exec, uid = () => pr
       const current = await capture(snapshot.row);
       if (snapshotKey(current) !== snapshotKey(snapshot)) fail(409, 'runtime_changed', '运行环境已改变，请重新预览。');
       let command;
-      try { command = await base.tmux(['kill-session', '-t', snapshot.session.id]); }
+      try { command = await execute('/usr/bin/python3', ['-I', '-c', stopProcesses, JSON.stringify(snapshot.processes)], { timeout: 5000, maxBuffer: 4096, env: { PATH: '/usr/bin:/bin' }, windowsHide: true }); }
       catch { return { status: 'unknown', reports: [{ phase: 'close', status: 'unknown' }] }; }
       try {
-        const server = await base.serverState(snapshot.server, true);
-        let absent = !server;
-        if (server) { const remaining = await base.tmux(['list-sessions', '-F', '#{session_id}']); if (remaining.code || remaining.stderr || remaining.stdout.split('\n').filter(Boolean).some(id => !/^\$\d+$/.test(id))) return { status: 'unknown' }; absent = !remaining.stdout.split('\n').includes(snapshot.session.id); }
         let alive = false;
-        for (const pane of snapshot.panes) { const process = await base.getProcess(pane.panePid); if (process?.startTicks === pane.process.startTicks) alive = true; }
-        const codex = await base.getProcess(snapshot.codex.pid); alive ||= codex?.startTicks === snapshot.codex.startTicks;
-        return { status: absent && !alive ? 'closed' : 'partial', reports: [{ phase: 'close', status: command.code || command.stderr ? 'uncertain' : 'requested' }, { phase: 'verification', status: absent && !alive ? 'closed' : 'partial' }] };
+        for (let n = 0; n < 20; n++) {
+          alive = false;
+          for (const expected of snapshot.processes) { const process = await base.getProcess(expected.pid); if (process?.startTicks === expected.startTicks) alive = true; }
+          if (!alive) break;
+          if (n < 19) await new Promise(done => setTimeout(done, 25));
+        }
+        return { status: !alive ? 'closed' : 'partial', reports: [{ phase: 'close', status: command.stderr || command.stdout?.trim() !== 'requested' ? 'uncertain' : 'requested' }, { phase: 'verification', status: !alive ? 'closed' : 'partial' }] };
       } catch { return { status: 'unknown', reports: [{ phase: 'verification', status: 'unknown' }] }; }
     }
   };
@@ -92,8 +102,8 @@ export function createRunControl({ rpc, observeProcesses = observeCodexProcesses
     const rows = new Map();
     for (const run of observation.managed) rows.set(pair(run), { ...run, runtimeId: run.id, rootThreadId: run.threadId, status: status(run.status), managed: true, canOpen: true, tmux: publicTmux(run.tmux) });
     for (const agent of observation.agents) {
-      if (agent.pid === observation.metadataPid || !idOK(agent.threadId) || !pidOK(agent.pid) || agent.tmuxState !== 'attached' || rows.has(pair(agent))) continue;
-      rows.set(pair(agent), { runtimeId: `manual-${hash([agent.threadId, agent.pid, agent.tmux?.sessionId, agent.tmux?.paneId]).slice(0, 32)}`, threadId: agent.threadId, cwd: agent.cwd, name: agent.name, pid: agent.pid, status: status(agent.status), managed: false, canOpen: true, tmuxState: 'attached', tmux: publicTmux(agent.tmux) });
+      if (agent.pid === observation.metadataPid || !pidOK(agent.pid) || rows.has(pair(agent))) continue;
+      rows.set(pair(agent), { runtimeId: `manual-${hash([agent.threadId, agent.pid, agent.tmux?.sessionId, agent.tmux?.paneId]).slice(0, 32)}`, threadId: idOK(agent.threadId) ? agent.threadId : null, cwd: agent.cwd, name: agent.name, pid: agent.pid, status: status(agent.status), managed: false, keepRunning: false, canOpen: idOK(agent.threadId), tmuxState: ['attached', 'none'].includes(agent.tmuxState) ? agent.tmuxState : 'unknown', tmux: publicTmux(agent.tmux), lifecycle: { version: null, idleSince: null, terminalSavedAt: null, reason: 'external_runtime' } });
     }
     return [...rows.values()].sort((a, b) => rank[a.status] - rank[b.status] || a.runtimeId.localeCompare(b.runtimeId));
   };
@@ -139,13 +149,14 @@ export function createRunControl({ rpc, observeProcesses = observeCodexProcesses
       const rows = await list(), row = rows.find(row => row.runtimeId === runtimeId);
       if (!row) fail(404, 'runtime_missing', '未找到该运行环境，请刷新。');
       const snapshot = row.managed ? null : await platform.capture(row);
-      const affected = rows.filter(other => row.managed ? other.pid === row.pid : other.tmux?.sessionId === row.tmux.sessionId && other.tmux?.sessionName === row.tmux.sessionName);
-      const affectedThreads = [...new Map(affected.map(item => [item.threadId, { id: item.threadId, name: item.name || item.threadId }])).values()];
+      const affectedPids = new Set(row.managed ? [row.pid] : snapshot.processes.map(process => process.pid));
+      const affected = rows.filter(other => affectedPids.has(other.pid));
+      const affectedThreads = [...new Map(affected.filter(item => idOK(item.threadId)).map(item => [item.threadId, { id: item.threadId, name: item.name || item.threadId }])).values()];
       const planId = `close-${randomBytes(24).toString('base64url')}`;
       const fingerprint = hash(affected.map(item => [item.runtimeId, item.threadId, item.pid, item.status]).sort());
       const plan = { row, snapshot, fingerprint, expiresAt: clock() + ttl, affectedThreads, executing: false, result: null }; plans.set(planId, plan);
       const codexPanes = new Set(affected.map(item => item.tmux?.paneId));
-      return { planId, scope: row.managed ? 'pane' : 'session', session: { id: row.tmux.sessionId, name: row.tmux.sessionName }, ...(row.managed ? { pane: { id: row.tmux.paneId, target: row.tmux.target }, otherPanesPreserved: true } : {}), affectedThreads, otherPanes: snapshot ? snapshot.panes.filter(pane => !codexPanes.has(pane.paneId)).map(pane => ({ paneId: pane.paneId, target: pane.target, label: '其他终端窗格' })) : [], working: affected.some(item => item.status === 'working' || item.status === 'waitingApproval'), requiresConfirmation: true, expiresAt: plan.expiresAt };
+      return { planId, scope: row.managed ? 'pane' : 'process', session: row.tmux ? { id: row.tmux.sessionId, name: row.tmux.sessionName } : null, pane: row.tmux ? { id: row.tmux.paneId, target: row.tmux.target } : null, otherPanesPreserved: true, tmuxUntouched: !row.managed, affectedThreads, otherPanes: snapshot ? snapshot.panes.filter(pane => !codexPanes.has(pane.paneId)).map(pane => ({ paneId: pane.paneId, target: pane.target, label: '其他终端窗格' })) : [], working: affected.some(item => item.status === 'working' || item.status === 'waitingApproval'), requiresConfirmation: true, expiresAt: plan.expiresAt };
     },
     async close(planId) {
       const plan = plans.get(planId);
@@ -156,14 +167,15 @@ export function createRunControl({ rpc, observeProcesses = observeCodexProcesses
       plan.executing = true;
       try {
         const rows = await list(), row = rows.find(row => row.runtimeId === plan.row.runtimeId);
-        const affected = rows.filter(other => plan.row.managed ? other.pid === plan.row.pid : other.tmux?.sessionId === plan.row.tmux.sessionId && other.tmux?.sessionName === plan.row.tmux.sessionName);
+        const affectedPids = new Set(plan.row.managed ? [plan.row.pid] : plan.snapshot.processes.map(process => process.pid));
+        const affected = rows.filter(other => affectedPids.has(other.pid));
         if (!row || hash(affected.map(item => [item.runtimeId, item.threadId, item.pid, item.status]).sort()) !== plan.fingerprint || (row.managed && row.revision !== plan.row.revision)) fail(409, 'runtime_changed', '运行环境已改变，请重新预览。');
         let result;
         if (row.managed) {
           try { const stopped = await rpc.stopRun(row.id, row.revision); result = { status: stopped?.stopped ? 'closed' : 'unknown' }; }
           catch (error) { if (error.code === 'runtime_changed') throw error; result = { status: 'unknown' }; }
         } else result = await platform.close(plan.snapshot);
-        plan.result = { ...result, runtimeId: row.runtimeId, scope: row.managed ? 'pane' : 'session', archived: false, affected: plan.affectedThreads.map(thread => ({ ...thread, status: result.status === 'closed' ? 'closed' : 'unknown' })) };
+        plan.result = { ...result, runtimeId: row.runtimeId, scope: row.managed ? 'pane' : 'process', archived: false, affected: plan.affectedThreads.map(thread => ({ ...thread, status: result.status === 'closed' ? 'closed' : 'unknown' })) };
         return copy(plan.result);
       } finally { plan.executing = false; }
     }

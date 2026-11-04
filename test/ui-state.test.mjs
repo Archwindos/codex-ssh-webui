@@ -174,7 +174,7 @@ test('overview has one in-flight request, refreshes every five seconds, and stop
 test('unknown metrics stay unknown and unconfirmed conversations stay out of the working list', t => {
   const f = fixture(t);
   f.run("renderOverview({ agents: [{ name: 'External child', threadId: 'child', source: 'external', status: 'unknown', canOpen: false }], metrics: { cpu: { percent: null, cores: 32 }, memory: { percent: null }, gpus: [{ name: 'GPU', utilizationPercent: null }], storage: [] }, coverage: { external: '部分状态未知' } })");
-  const resources = f.nodes.get('resource-list').children;
+  const resources = f.nodes.get('resource-list').children.flatMap(group => group.children);
   assert.equal(resources[0].children[1].children[0].children[0].textContent, '暂不可用');
   assert.equal(f.nodes.get('agent-summary').textContent, '部分会话状态暂不可确认');
   assert.doesNotMatch(textOf(f.nodes.get('agents')), /External child/);
@@ -223,20 +223,51 @@ test('working cards display verified tmux targets and explicit none or unknown s
 
 test('compact resources retain sampled utilization, memory capacities and actual disk available bytes', t => {
   const f = fixture(t), gb = 1024 ** 3;
-  f.run(`renderOverview({ agents: [], metrics: { cpu: { percent: 12.6, cores: 32 }, memory: { usedBytes: ${108 * gb}, totalBytes: ${252 * gb}, percent: 42.857 }, gpus: [{ index: 0, name: 'Long GPU model not needed here', utilizationPercent: 0, memoryUsedBytes: ${8.5 * gb}, memoryTotalBytes: ${24 * gb}, temperatureC: 72 }, { index: 1, utilizationPercent: 0, memoryUsedBytes: 0, memoryTotalBytes: ${24 * gb} }], storage: [{ path: '/srv/storage', totalBytes: ${100 * gb}, usedBytes: ${30 * gb}, availableBytes: ${68 * gb}, percent: 30 }, { path: '/srv/unknown', availableBytes: null }] } })`);
+  f.run(`renderOverview({ agents: [], metrics: { cpu: { percent: 12.6, cores: 32 }, memory: { usedBytes: ${108 * gb}, totalBytes: ${252 * gb}, percent: 42.857 }, gpus: [{ index: 0, name: 'Long GPU model not needed here', utilizationPercent: 0, memoryUsedBytes: ${8.5 * gb}, memoryTotalBytes: ${24 * gb}, temperatureC: 72 }, { index: 1, utilizationPercent: 0, memoryUsedBytes: 0, memoryTotalBytes: ${24 * gb} }], storage: [{ path: '/storage/data', totalBytes: ${100 * gb}, usedBytes: ${30 * gb}, availableBytes: ${68 * gb}, percent: 30 }, { path: '/storage/unknown', availableBytes: null }] } })`);
   const resources = textOf(f.nodes.get('resource-list'));
   assert.match(resources, /CPU 13%/); assert.match(resources, /内存 108 GB \/ 252 GB/);
-  assert.match(resources, /GPU 0 0% 显存 8\.5 GB \/ 24 GB/);
-  assert.match(resources, /GPU 1 0% 显存 0 B \/ 24 GB/);
-  assert.match(resources, /\/srv\/storage 30 GB \/ 100 GB 68 GB 可用/);
-  assert.match(resources, /\/srv\/unknown 暂不可用/);
+  assert.match(resources, /GPU 0 计算 0% 显存 8\.5 GB \/ 24 GB/);
+  assert.match(resources, /GPU 1 计算 0% 显存 0 B \/ 24 GB/);
+  assert.match(resources, /\/storage\/data 30 GB \/ 100 GB 68 GB 可用/);
+  assert.match(resources, /\/storage\/unknown 暂不可用/);
   assert.doesNotMatch(resources, /70 GB|Long GPU|72|32 核|42\.857|\.0 GB|0\.0 KB/);
-  const rows = f.nodes.get('resource-list').children;
+  const groups = f.nodes.get('resource-list').children;
+  assert.deepEqual(groups.map(group => group.dataset.resourceFamily), ['system', 'gpu', 'storage']);
+  assert.deepEqual(groups.map(group => group.children.length), [2, 2, 2]);
+  assert.deepEqual(groups[0].children.map(row => row.children[0].textContent), ['CPU', '内存']);
+  const rows = groups.flatMap(group => group.children);
   assert.equal(rows[0].children[1].children[1].children[0].style.values['--usage'], '12.6%');
   assert.equal(rows[2].children[1].children[1].children[0].style.values['--usage'], '0%');
-  assert.equal(rows[2].children[1].children[2].children[0].dataset.percent, String(8.5 / 24 * 100));
+  assert.equal(rows[2].children[1].children[3].children[0].dataset.percent, String(8.5 / 24 * 100));
   assert.equal(rows[4].children[1].children[1].children[0].dataset.percent, '30');
   assert.equal(rows[5].children[1].children[1].dataset.known, 'false'); assert.equal(rows[5].children[1].children[1].children.length, 0);
+});
+
+test('GPU compute and VRAM stay distinct, and high VRAM warns even at zero or unknown compute', t => {
+  const f = fixture(t), gb = 1024 ** 3;
+  f.run(`renderOverview({ agents: [], metrics: { gpus: [
+    { index: 2, utilizationPercent: 0, memoryUsedBytes: ${77.3 * gb}, memoryTotalBytes: ${80 * gb} },
+    { index: 3, utilizationPercent: null, memoryUsedBytes: ${76 * gb}, memoryTotalBytes: ${80 * gb} },
+    { index: 4, utilizationPercent: null, memoryUsedBytes: null, memoryTotalBytes: null },
+    { index: 5, utilizationPercent: 100, memoryUsedBytes: 0, memoryTotalBytes: ${80 * gb} }
+  ] } })`);
+  const groups = f.nodes.get('resource-list').children, gpus = groups[1].children;
+  assert.match(textOf(gpus[0]), /GPU 2 计算 0% 显存 77\.3 GB \/ 80 GB 显存占用高 · 96\.6%/);
+  assert.equal(gpus[0].dataset.memoryPressure, 'high');
+  assert.equal(gpus[0].children[1].children[1].children[0].style.values['--usage'], '0%');
+  assert.equal(gpus[0].children[1].children[3].children[0].dataset.percent, String(77.3 / 80 * 100));
+  assert.match(textOf(gpus[1]), /计算 暂不可用 显存 76 GB \/ 80 GB 显存占用高 · 95%/);
+  assert.equal(gpus[1].dataset.memoryPressure, 'high');
+  assert.match(textOf(gpus[2]), /计算 暂不可用 显存未知/);
+  assert.equal(gpus[2].dataset.memoryPressure, 'unknown');
+  for (const index of [1, 3]) { assert.equal(gpus[2].children[1].children[index].dataset.known, 'false'); assert.equal(gpus[2].children[1].children[index].children.length, 0); }
+  assert.doesNotMatch(textOf(gpus[2]), /0%|0 B|显存占用高/);
+  assert.equal(gpus[3].dataset.memoryPressure, 'normal');
+  assert.doesNotMatch(textOf(gpus[3]), /显存占用高/);
+  assert.doesNotMatch(textOf(gpus[0]), /空闲|繁忙|可用|忙碌/);
+  assert.doesNotMatch(textOf(groups[1]), /空闲|繁忙|可分配|忙碌/);
+  assert.deepEqual(groups.map(group => group.dataset.resourceFamily), ['system', 'gpu', 'storage']);
+  assert.deepEqual(groups.map(group => group.children.length), [2, 4, 1]);
 });
 
 test('sending, reasoning deltas, tools, approval and completion have distinct activity states', async t => {
@@ -538,4 +569,242 @@ test('P-256 signing uses a nonexportable key and rejects challenges for another 
   const signature = await f.run(`signDeviceChallenge(testDeviceRecord, ${JSON.stringify(challenge)}, 'device-login')`); assert.equal(Buffer.from(signature, 'base64url').length, 64);
   const publicKey = await webcrypto.subtle.importKey('spki', spki, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']); assert.equal(await webcrypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, publicKey, Buffer.from(signature, 'base64url'), new TextEncoder().encode(challenge.message)), true);
   for (const mutation of [{ origin: 'http://127.0.0.1:8444' }, { keyHash: '0'.repeat(64) }, { purpose: 'device-enroll' }, { deviceId: 'another-device' }, { challengeId: 'another-challenge' }]) await assert.rejects(f.run(`signDeviceChallenge(testDeviceRecord, ${JSON.stringify({ ...challenge, message: JSON.stringify({ ...message, ...mutation }) })}, 'device-login')`));
+});
+
+
+function enableCatalog(f) {
+  f.run("state.session.capabilities = { chatCatalog: true, library: true, runtimeManagement: true, allThreads: true, projectManagement: true, workspaceBrowser: true, archiveManagement: true }; state.session.projects = [{ id: 'one', name: 'Research', defaultCwd: '/research', revision: 'r1' }, { id: 'two', name: 'Ideas', defaultCwd: null, revision: 'r2' }]; state.session.workspace = { defaultCwd: '/workspace' }; state.projectId = null; renderProjects()");
+}
+
+test('catalog new chat needs no project and creates only on first message with its separate cwd', async t => {
+  const f = fixture(t, async url => response(url === '/api/threads' ? { thread: { id: 'new-chat', cwd: '/workspace', projectId: null, turns: [], runtimes: [{ runtimeId: 'run-new', managed: true, status: 'idle' }] } } : url === '/api/turns' ? { turn: { id: 'turn', status: 'completed' } } : { data: [], nextCursor: null }));
+  enableCatalog(f); await f.run('openNewThread()');
+  assert.equal(f.requests.length, 0); assert.equal(f.run('state.thread'), null); assert.equal(f.run('state.projectId'), null); assert.equal(f.nodes.get('draft-cwd').value, '/workspace'); assert.equal(f.nodes.get('prompt').disabled, false);
+  f.run("$('prompt').value = 'start here'; controls()"); f.event('composer', 'submit'); await flush();
+  assert.deepEqual(f.requests.find(request => request.url === '/api/threads').body, { cwd: '/workspace', projectId: null });
+  assert.deepEqual(f.requests.find(request => request.url === '/api/turns').body, { threadId: 'new-chat', text: 'start here', submissionId: 'ui-submission' });
+  assert.equal(f.run('state.thread.id'), 'new-chat'); assert.equal(f.requests.some(request => request.url === '/api/projects' || request.url.startsWith('/api/directories')), false);
+});
+
+test('catalog selected project supplies an optional draft default without changing that project when cwd is edited', async t => {
+  const f = fixture(t); enableCatalog(f); await f.run("openNewThread('one')");
+  assert.equal(f.nodes.get('draft-cwd').value, '/research');
+  f.nodes.get('draft-cwd').value = '/scratch'; f.event('draft-cwd', 'input');
+  assert.equal(f.run('state.draftCwd'), '/scratch'); assert.equal(f.run('state.session.projects[0].defaultCwd'), '/research');
+  f.nodes.get('project').value = 'two'; f.event('project', 'change'); await flush();
+  assert.equal(f.run('state.projectId'), 'two'); assert.equal(f.nodes.get('draft-cwd').value, '/workspace'); assert.equal(f.requests.length, 0);
+});
+
+test('catalog project creates with a name and optional folder, retains idempotency on uncertain retry, and never creates a chat', async t => {
+  let attempts = 0;
+  const f = fixture(t, async url => url === '/api/projects' && ++attempts === 1 ? response({ error: { message: 'temporary failure' } }, 503) : response(url === '/api/projects' ? { project: { id: 'new-project', name: 'New group', defaultCwd: null, revision: 'native-r1' } } : { data: [], nextCursor: null }));
+  enableCatalog(f); await f.run('openProjectEditor()'); assert.equal(f.requests.length, 0);
+  f.nodes.get('project-name').value = 'New group'; await f.run('saveProject()');
+  assert.equal(f.run('state.view'), 'directory'); assert.equal(f.nodes.get('project-name').value, 'New group');
+  await f.run('saveProject()');
+  const writes = f.requests.filter(request => request.url === '/api/projects');
+  assert.deepEqual(writes[0].body, { name: 'New group', defaultCwd: null, idempotencyKey: 'ui-submission' }); assert.deepEqual(writes[1].body, writes[0].body);
+  assert.equal(f.requests.some(request => request.url === '/api/threads' || request.url === '/api/turns' || request.url.startsWith('/api/directories')), false);
+});
+
+test('catalog renaming and moving a chat preserves its id, cwd, history and active runtime', async t => {
+  const moved = { id: 'original', name: 'Renamed', projectId: 'two', cwd: '/original-cwd', pinned: false, turns: [{ id: 'history', items: [] }], runtimes: [{ runtimeId: 'same-run', managed: true, status: 'idle' }] };
+  const f = fixture(t, async () => response({ thread: moved })); enableCatalog(f);
+  f.run("renderThread({ id: 'original', name: 'Old', cwd: '/original-cwd', projectId: 'one', turns: [{ id: 'history', items: [] }], runtimes: [{ runtimeId: 'same-run', managed: true, status: 'idle' }] }); openThreadSettings(state.thread)");
+  f.nodes.get('thread-name').value = 'Renamed'; f.nodes.get('thread-project').value = 'two'; await f.run('saveThreadSettings()');
+  assert.deepEqual(f.requests[0].body, { threadId: 'original', name: 'Renamed', projectId: 'two' }); assert.equal(f.requests.length, 1);
+  assert.equal(f.run('state.thread.id'), 'original'); assert.equal(f.run('state.thread.cwd'), '/original-cwd'); assert.equal(f.run('state.thread.turns[0].id'), 'history'); assert.equal(f.run('state.thread.runtimes[0].runtimeId'), 'same-run'); assert.equal(f.run('state.threadProjectId'), 'two');
+});
+
+test('catalog updates a project default without moving the viewed chat or changing its cwd', async t => {
+  const f = fixture(t, async url => response(url === '/api/projects/update' ? { project: { id: 'one', name: 'Research renamed', defaultCwd: '/future', revision: 'r2' } } : { data: [], nextCursor: null })); enableCatalog(f);
+  f.run("renderThread({ id: 'original', cwd: '/old-cwd', projectId: 'one', turns: [] }); state.projectId = 'one'"); await f.run('openProjectEditor(true)');
+  f.nodes.get('project-name').value = 'Research renamed'; f.nodes.get('directory-path').value = '/future'; f.event('directory-path', 'input'); await f.run('saveProject()');
+  assert.deepEqual(f.requests.find(request => request.url === '/api/projects/update').body, { projectId: 'one', name: 'Research renamed', defaultCwd: '/future', revision: 'r1' }); assert.equal(f.run('state.thread.cwd'), '/old-cwd'); assert.equal(f.run('state.thread.projectId'), 'one');
+  await f.run("openNewThread('one')"); assert.equal(f.nodes.get('draft-cwd').value, '/future');
+});
+
+test('catalog stopped chat is readable and sending resumes the original id without a manual join', async t => {
+  const f = fixture(t, async () => response({ thread: { id: 'stopped', cwd: '/original', projectId: null, runtimes: [{ runtimeId: 'resumed-run', managed: true, status: 'working' }] }, turn: { id: 'new-turn', status: 'inProgress' } })); enableCatalog(f);
+  f.run("renderThread({ id: 'stopped', cwd: '/original', projectId: null, runtimes: [], turns: [{ id: 'old', items: [{ id: 'old-message', type: 'agentMessage', text: 'saved history' }] }] }); $('prompt').value = 'continue'; controls()");
+  assert.equal(f.nodes.get('prompt').disabled, false); assert.equal(f.nodes.get('send').disabled, false); assert.match(f.nodes.get('run-state-text').textContent, /发送消息会恢复原对话/);
+  f.event('composer', 'submit'); await flush();
+  assert.deepEqual(f.requests[0].body, { threadId: 'stopped', text: 'continue', submissionId: 'ui-submission' }); assert.equal(f.requests.length, 1); assert.equal(f.run('state.thread.runtimes[0].runtimeId'), 'resumed-run'); assert.equal(f.run("state.items.get('old-message').body.textContent"), 'saved history');
+});
+
+test('catalog external run stays read-only and safe stop still requires an explicit preview and confirmation', async t => {
+  const f = fixture(t, async url => response(url.endsWith('/preview') ? { planId: 'stop-external', scope: 'process', affectedThreads: [{ id: 'external', name: 'External' }] } : { status: 'closed', affected: [{ runtimeId: 'external-run', status: 'closed' }] })); enableCatalog(f);
+  f.run("renderThread({ id: 'external', cwd: '/original', readOnly: true, runtimes: [{ runtimeId: 'external-run', managed: false, status: 'working' }], turns: [] }); $('prompt').value = 'do not send'; controls()");
+  assert.equal(f.nodes.get('send').disabled, true); assert.equal(f.nodes.get('join-thread').textContent, '安全停止外部运行');
+  await f.run('joinThread()'); assert.equal(f.requests.length, 1); assert.equal(f.requests[0].url, '/api/runtimes/close/preview'); assert.match(f.nodes.get('operation-description').textContent, /外部 Codex 进程/);
+  assert.equal(f.requests.some(request => request.url === '/api/turns'), false); await f.run('confirmOperation()');
+  assert.equal(f.requests[1].url, '/api/runtimes/close'); assert.equal(f.run('state.thread.readOnly'), false); assert.equal(f.run('state.thread.runtimes.length'), 0); assert.equal(f.nodes.get('send').disabled, false);
+});
+
+test('catalog title search queries the native library and does not replace recent sidebar chats', async t => {
+  const f = fixture(t, async () => response({ data: [{ id: 'older-hit', name: 'Unique title', cwd: '/old', projectId: null, runtimes: [] }], nextCursor: 'opaque-next' })); enableCatalog(f);
+  f.run("state.recentThreads = [{ id: 'recent', name: 'Recent', cwd: '/recent', projectId: null, runtimes: [] }]; renderSidebar(); $('sidebar-search').value = 'Unique title'");
+  f.event('sidebar-search-form', 'submit'); await flush();
+  assert.equal(f.requests[0].url, '/api/threads?project=all&archived=false&search=Unique%20title'); assert.equal(f.run('state.libraryThreads[0].id'), 'older-hit'); assert.equal(f.run('state.recentThreads[0].id'), 'recent'); assert.equal(f.run('state.cursor'), 'opaque-next'); assert.equal(f.nodes.get('library-older').hidden, false);
+  assert.match(textOf(f.nodes.get('threads')), /Recent/); assert.doesNotMatch(textOf(f.nodes.get('threads')), /older-hit/);
+});
+
+test('catalog reads pinned chats beyond the recent page and project selection only changes the library view', async t => {
+  const f = fixture(t, async url => response(url.includes('pinned=true') ? { data: [{ id: 'older-pin', name: 'Older pinned', pinned: true, projectId: 'one', runtimes: [] }], nextCursor: null } : { data: [{ id: 'recent', name: 'Recent', projectId: null, runtimes: [] }], nextCursor: 'recent-next' })); enableCatalog(f);
+  await f.run('history()'); assert.equal(f.requests.some(request => request.url === '/api/threads?project=all&archived=false&pinned=true'), true); assert.match(textOf(f.nodes.get('pinned-threads')), /Older pinned/);
+  f.run("renderThread({ id: 'viewed', cwd: '/fixed', projectId: null, runtimes: [], turns: [] }); openProjectLibrary('one')"); await flush();
+  assert.equal(f.run('state.thread.id'), 'viewed'); assert.equal(f.run('state.thread.cwd'), '/fixed'); assert.equal(f.run('state.projectId'), null); assert.equal(f.run('state.libraryProjectId'), 'one'); assert.match(f.requests.find(request => request.url.includes('project=one')).url, /project=one&archived=false/);
+});
+
+test('catalog keep-running policy is per-chat and a failed save restores the confirmed checkbox', async t => {
+  let fail = false;
+  const f = fixture(t, async () => fail ? response({ error: { message: 'not saved' } }, 503) : response({ threadId: 'policy-chat', keepRunning: true })); enableCatalog(f);
+  f.run("renderThread({ id: 'policy-chat', cwd: '/policy', keepRunning: false, projectId: null, runtimes: [{ runtimeId: 'run', managed: true, status: 'idle' }], turns: [] })");
+  assert.match(f.nodes.get('idle-policy').textContent, /2 小时/); await f.run('setKeepRunning(state.thread, true)');
+  assert.deepEqual(f.requests[0].body, { threadId: 'policy-chat', keepRunning: true }); assert.equal(f.nodes.get('keep-running').checked, true); assert.match(f.nodes.get('idle-policy').textContent, /已暂停/);
+  fail = true; f.nodes.get('keep-running').checked = false; f.event('keep-running', 'change'); await flush();
+  assert.equal(f.run('state.thread.keepRunning'), true); assert.equal(f.nodes.get('keep-running').checked, true); assert.equal(f.nodes.get('keep-running').disabled, false);
+});
+
+test('catalog runtime overview includes Codex without tmux and retains honest unknown states and verified tmux ids', t => {
+  const f = fixture(t); enableCatalog(f);
+  f.run("renderOverview({ agents: [{ runtimeId: 'unknown', threadId: 'u', name: 'Unknown', managed: true, status: 'unknown', tmuxState: 'unknown' }, { runtimeId: 'external', threadId: 'e', name: 'External', managed: false, status: 'working', tmuxState: 'none' }, { runtimeId: 'managed', threadId: 'm', name: 'Managed', managed: true, status: 'idle', tmuxState: 'attached', tmux: { sessionName: 'dedicated', target: '$8:0.0' } }], metrics: {} })");
+  const cards = f.nodes.get('agents').children;
+  assert.deepEqual(cards.map(card => card.dataset.runtimeId), ['external', 'managed', 'unknown']); assert.match(textOf(cards[0]), /外部运行/); assert.match(textOf(cards[1]), /tmux \$8:0\.0/); assert.match(textOf(cards[2]), /状态未知/); assert.match(textOf(cards[2]), /无法确认 tmux/);
+});
+
+
+test('catalog archived chats offer history reading while metadata and keep-running editing stay unavailable', async t => {
+  const f = fixture(t); enableCatalog(f);
+  f.run("state.libraryThreads = [{ id: 'archived', name: 'Saved title', archived: true, projectId: 'one', cwd: '/saved', runtimes: [], turns: [] }]; state.archived = true; renderLibrary(); renderThread(state.libraryThreads[0])");
+  const actions = f.nodes.get('library-list').children[0].children[1]; assert.equal(textOf(actions), '查看');
+  assert.equal(f.nodes.get('chat-menu').hidden, true); assert.equal(f.nodes.get('chat-actions').hidden, true); assert.equal(f.nodes.get('chat-lifecycle').hidden, true);
+  assert.equal(f.run('threadActions(state.thread).children.length'), 0);
+  await f.run("updateThreadMetadata(state.thread, { name: 'Blocked', pinned: true, projectId: 'two' }); openThreadSettings(state.thread); setKeepRunning(state.thread, true)");
+  assert.equal(f.requests.length, 0); assert.equal(f.run('state.threadEdit'), null); assert.equal(f.run('state.thread.name'), 'Saved title'); assert.equal(f.run('state.thread.projectId'), 'one');
+});
+
+
+function presenceRequests(f) { return f.requests.filter(request => request.url === '/api/runtime-presence'); }
+function enablePresence(f) { enableCatalog(f); f.run("state.session.capabilities.runtimePresence = true; $('error').hidden = true"); }
+
+test('visible chat presence renews every twenty seconds and cached threads on Home or Library do not stay connected', async t => {
+  const f = fixture(t, async url => response(url === '/api/runtime-presence' ? { connected: true, leaseMs: 90000 } : { data: [], nextCursor: null })); enablePresence(f);
+  f.run("renderThread({ id: 'viewed-chat', cwd: '/chat', projectId: null, runtimes: [], turns: [] })"); await f.run('runtimePresence.queue');
+  assert.equal(presenceRequests(f).length, 1); const first = presenceRequests(f)[0].body; assert.equal(first.threadId, 'viewed-chat'); assert.match(first.clientId, /^[A-Za-z0-9_-]{1,128}$/);
+  assert.equal([...f.timers.values()].filter(timer => timer.ms === 20000).length, 1);
+  const timer = f.run('runtimePresence.timer'); f.timers.get(timer).fn(); await f.run('runtimePresence.queue'); assert.equal(presenceRequests(f).length, 2); assert.deepEqual(presenceRequests(f)[1].body, first);
+  f.run("showView('home')"); await f.run('runtimePresence.queue'); assert.equal(presenceRequests(f).at(-1).body.threadId, null); assert.equal(f.run('state.thread.id'), 'viewed-chat'); assert.equal(f.run('runtimePresence.timer'), null);
+  const count = presenceRequests(f).length; f.run("showView('library'); controls(); renderView()"); await flush(); await f.run('runtimePresence.queue'); assert.equal(presenceRequests(f).length, count);
+  assert.equal(f.requests.some(request => request.url === '/api/threads' || request.url === '/api/turns'), false);
+});
+
+test('presence release and replacement registration stay ordered when switching chats during an in-flight release', async t => {
+  const release = deferred(); let requests = 0;
+  const f = fixture(t, async url => url === '/api/runtime-presence' && ++requests === 2 ? release.promise : response({ data: [], nextCursor: null })); enablePresence(f);
+  f.run("renderThread({ id: 'chat-a', cwd: '/a', turns: [] })"); await f.run('runtimePresence.queue');
+  f.run("showView('home')"); await flush(); assert.equal(presenceRequests(f).length, 2);
+  f.run("renderThread({ id: 'chat-b', cwd: '/b', turns: [] })"); await flush(); assert.equal(presenceRequests(f).length, 2, 'replacement cannot overtake an older release');
+  release.resolve(response({ threadId: null, connected: false, leaseMs: 90000 })); await f.run('runtimePresence.queue');
+  assert.deepEqual(presenceRequests(f).map(request => request.body.threadId), ['chat-a', null, 'chat-b']); assert.equal(new Set(presenceRequests(f).map(request => request.body.clientId)).size, 1);
+  f.run("renderThread({ id: 'chat-c', cwd: '/c', turns: [] }); showView('home'); renderThread({ id: 'chat-d', cwd: '/d', turns: [] })"); await f.run('runtimePresence.queue');
+  assert.equal(presenceRequests(f).at(-1).body.threadId, 'chat-d'); assert.equal(presenceRequests(f).some(request => request.body.threadId === 'chat-c'), false);
+});
+
+test('hidden, pagehide and logout release presence with authenticated keepalive fetch and foreground restores only the viewed chat', async t => {
+  const windowListeners = new Map();
+  const f = fixture(t, async url => response(url === '/api/runtime-presence' ? { connected: true, leaseMs: 90000 } : {}), { location: deviceLocation(), window: { addEventListener(name, fn) { windowListeners.set(name, fn); } } }); enablePresence(f);
+  f.run("state.session.authTransport = 'bearer'; rememberToken('a'.repeat(43)); hydrate = async () => controls(); renderThread({ id: 'phone-chat', cwd: '/phone', turns: [] })"); await f.run('runtimePresence.queue');
+  f.document.visibilityState = 'hidden'; f.listeners.get('visibilitychange')(); await f.run('runtimePresence.queue');
+  const hidden = presenceRequests(f).at(-1); assert.equal(hidden.body.threadId, null); assert.equal(hidden.options.keepalive, true); assert.equal(hidden.options.credentials, 'omit'); assert.equal(hidden.options.headers.Authorization, `Bearer ${'a'.repeat(43)}`); assert.equal(hidden.options.headers['X-CSRF-Token'], 'fixture-csrf'); assert.equal(hidden.options.headers['X-Relay-Origin'], deviceLocation().origin);
+  f.document.visibilityState = 'visible'; f.listeners.get('visibilitychange')(); await flush(); await f.run('runtimePresence.queue'); assert.equal(presenceRequests(f).at(-1).body.threadId, 'phone-chat');
+  windowListeners.get('pagehide')(); await f.run('runtimePresence.queue'); assert.equal(presenceRequests(f).at(-1).body.threadId, null); assert.equal(f.run('runtimePresence.timer'), null);
+  windowListeners.get('pageshow')(); await f.run('runtimePresence.queue'); assert.equal(presenceRequests(f).at(-1).body.threadId, 'phone-chat');
+  f.run('hydrate = async () => setAuthenticated(false)'); f.event('logout'); await flush(); await f.run('runtimePresence.queue'); await flush();
+  const relevant = f.requests.filter(request => ['/api/runtime-presence', '/api/logout'].includes(request.url)); assert.equal(relevant.at(-2).body.threadId, null); assert.equal(relevant.at(-1).url, '/api/logout'); assert.equal(f.run('state.session.authenticated'), false); assert.equal(f.run('runtimePresence.timer'), null);
+});
+
+test('presence transient errors retry only on the twenty-second cadence while auth errors stop until recovery', async t => {
+  let status = 503;
+  const f = fixture(t, async () => response({}, status)); enablePresence(f);
+  f.run("renderThread({ id: 'retry-chat', cwd: '/retry', turns: [] })"); await f.run('runtimePresence.queue'); assert.equal(presenceRequests(f).length, 1); assert.equal(f.nodes.get('error').hidden, true);
+  f.run('controls(); renderView(); controls()'); await flush(); assert.equal(presenceRequests(f).length, 1);
+  assert.equal(f.timers.get(f.run('runtimePresence.timer')).ms, 20000); status = 200; f.timers.get(f.run('runtimePresence.timer')).fn(); await f.run('runtimePresence.queue'); assert.equal(presenceRequests(f).length, 2); assert.equal(f.run('runtimePresence.failed'), false);
+  status = 401; f.timers.get(f.run('runtimePresence.timer')).fn(); await f.run('runtimePresence.queue'); assert.equal(f.run('runtimePresence.timer'), null); const count = presenceRequests(f).length; f.run('controls(); renderView()'); await flush(); assert.equal(presenceRequests(f).length, count);
+  status = 200; f.run("connection(false, 'offline')"); await f.run('runtimePresence.queue'); assert.equal(f.run('runtimePresence.timer'), null);
+  f.run("connection(true, 'online')"); await f.run('runtimePresence.queue'); assert.equal(presenceRequests(f).at(-1).body.threadId, 'retry-chat'); assert.ok(f.run('runtimePresence.timer') !== null); assert.equal(f.nodes.get('error').hidden, true);
+});
+
+test('presence uses one random id per page lifecycle without session storage and starts only after a real chat exists', async t => {
+  const fetcher = async url => response(url === '/api/threads' ? { thread: { id: 'created-chat', cwd: '/workspace', projectId: null, turns: [], runtimes: [] } } : { data: [], nextCursor: null });
+  const first = fixture(t, fetcher, { crypto: { randomUUID: () => 'page-one' } }), second = fixture(t, fetcher, { crypto: { randomUUID: () => 'page-two' } }); enablePresence(first); enablePresence(second);
+  await first.run('openNewThread()'); await first.run('runtimePresence.queue'); assert.equal(presenceRequests(first).length, 0);
+  await first.run('createThread()'); await first.run('runtimePresence.queue'); assert.equal(presenceRequests(first)[0].body.threadId, 'created-chat'); assert.equal(presenceRequests(first)[0].body.clientId, 'page-one');
+  second.run("renderThread({ id: 'created-chat', cwd: '/chat', turns: [] })"); await second.run('runtimePresence.queue'); assert.equal(presenceRequests(second)[0].body.clientId, 'page-two');
+  assert.equal([...first.storage.values(), ...second.storage.values()].some(value => String(value).includes('page-one') || String(value).includes('page-two')), false);
+});
+
+
+function seedClosingChat(f, { runtimeId = 'run-old', turnId = 'turn-old', pinned = true } = {}) {
+  f.run(`var closingThread = { id: 'closing-chat', name: 'Closing chat', cwd: '/closing', projectId: null, pinned: ${pinned}, status: 'active', runtimes: [{ runtimeId: '${runtimeId}', managed: true, status: 'working' }], turns: [{ id: '${turnId}', status: 'inProgress', items: [{ id: 'saved-answer', type: 'agentMessage', text: 'History remains' }] }] }; state.libraryThreads = [JSON.parse(JSON.stringify(closingThread))]; state.recentThreads = [JSON.parse(JSON.stringify(closingThread))]; state.pinnedThreads = ${pinned} ? [JSON.parse(JSON.stringify(closingThread))] : []; renderThread(closingThread); $('prompt').value = 'continue later'; controls()`);
+}
+
+test('runtime identity closure clears expired approvals and all matching caches while preserving readable history', t => {
+  const f = fixture(t); enableCatalog(f); seedClosingChat(f);
+  f.run("state.approvals.set('run-old:approval', { id: 'run-old:approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'closing-chat', turnId: 'turn-old', itemId: 'command' } }); state.session.pendingApprovals = [...state.approvals.values()]; renderApprovals(); state.chatActionsOpen = true; renderChatActions(); handleEvent('relay', { status: 'runtime-closed', runtimeId: 'run-old', threadId: 'closing-chat' }, 100)");
+  for (const list of ['libraryThreads', 'recentThreads', 'pinnedThreads']) { assert.equal(f.run(`state.${list}[0].runtimes.length`), 0); assert.equal(f.run(`threadStatus(state.${list}[0])`), '已停止'); }
+  assert.equal(f.run('state.busy'), false); assert.equal(f.run('state.turnId'), null); assert.equal(f.run('state.approvals.size'), 0); assert.equal(f.run('state.session.pendingApprovals.length'), 0); assert.equal(f.nodes.get('approvals').hidden, true); assert.equal(f.run('state.activityPhase'), 'closed'); assert.equal(f.run('state.activitySince'), null); assert.equal(f.run('state.activityTimer'), null); assert.equal(f.nodes.get('run-state').dataset.active, 'false');
+  assert.equal(f.nodes.get('send').disabled, false); assert.equal(f.run("state.items.get('saved-answer').body.textContent"), 'History remains'); assert.equal(f.run('state.thread.turns[0].status'), 'inProgress', 'stored historical status is not rewritten'); assert.doesNotMatch(textOf(f.nodes.get('chat-actions')), /停止运行/); assert.match(textOf(f.nodes.get('pinned-threads')), /已停止/); assert.equal(f.requests.length, 0);
+});
+
+test('late closure of an old runtime cannot clear the replacement turn, runtime or approvals', t => {
+  const f = fixture(t); enableCatalog(f); seedClosingChat(f, { runtimeId: 'run-new', turnId: 'turn-new' });
+  f.run("state.recentThreads[0].runtimes = [{ runtimeId: 'run-old', managed: true, status: 'working' }]; state.approvals.set('run-old:approval', { id: 'run-old:approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'closing-chat', turnId: 'turn-old', itemId: 'old' } }); state.approvals.set('run-new:approval', { id: 'run-new:approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'closing-chat', turnId: 'turn-new', itemId: 'new' } }); renderApprovals(); handleEvent('relay', { status: 'runtime-closed', runtimeId: 'run-old', threadId: 'closing-chat', superseded: true }, 101)");
+  assert.equal(f.run('state.thread.runtimes[0].runtimeId'), 'run-new'); assert.equal(f.run('state.busy'), true); assert.equal(f.run('state.turnId'), 'turn-new'); assert.equal(f.nodes.get('send').disabled, true); assert.equal(f.run("state.approvals.has('run-new:approval')"), true); assert.equal(f.run("state.approvals.has('run-old:approval')"), false); assert.equal(f.run('state.activityPhase'), 'approval');
+  assert.equal(f.run('state.recentThreads[0].runtimes[0].runtimeId'), 'run-new'); assert.equal(f.requests.length, 0);
+});
+
+test('superseded closure with no replacement snapshot reads state instead of unlocking a possibly new active turn', async t => {
+  const f = fixture(t); enableCatalog(f); seedClosingChat(f);
+  // Keep the authoritative refresh pending while checking the synchronous closure state.
+  f.run('var replacementReads = 0; var releaseReplacement; var replacementReady = new Promise(resolve => { releaseReplacement = resolve; }); hydrate = async () => { replacementReads++; await replacementReady; }');
+  f.run("handleEvent('relay', { status: 'runtime-closed', runtimeId: 'run-old', threadId: 'closing-chat', superseded: true }, 102)"); await flush();
+  assert.equal(f.run('replacementReads'), 1); assert.equal(f.run('state.busy'), true); assert.equal(f.run('state.turnId'), 'turn-old'); assert.equal(f.nodes.get('send').disabled, true); assert.notEqual(f.run('state.activityPhase'), 'closed'); assert.equal(f.requests.length, 0);
+  f.run('releaseReplacement()'); await f.run('replacementReady');
+});
+
+test('runtime-cleaned applies per-runtime closure immediately on Home and repeated receipts are idempotent', t => {
+  const f = fixture(t); enableCatalog(f); seedClosingChat(f);
+  f.run("var overviewRefreshes = 0; refreshOverview = async () => { overviewRefreshes++; }; state.view = 'home'; renderOverview({ agents: [{ runtimeId: 'run-old', threadId: 'closing-chat', name: 'Closed', managed: true, status: 'working' }, { runtimeId: 'other-run', threadId: 'other-chat', name: 'Other still running', managed: true, status: 'working' }], metrics: {} }); handleEvent('relay', { status: 'runtime-cleaned', closedRuntimes: [{ runtimeId: 'run-old', threadId: 'closing-chat' }], message: 'Reaped' }, 103)");
+  assert.equal(f.run('state.thread.runtimes.length'), 0); assert.equal(f.run('state.busy'), false); assert.equal(f.run('overviewRefreshes'), 1); assert.equal(f.run('state.overview.agents.length'), 1); assert.equal(f.run('state.overview.agents[0].runtimeId'), 'other-run'); assert.doesNotMatch(textOf(f.nodes.get('agents')), /Closed/); assert.match(textOf(f.nodes.get('agents')), /Other still running/);
+  f.run("handleEvent('relay', { status: 'runtime-cleaned', closedRuntimes: [{ runtimeId: 'run-old', threadId: 'closing-chat' }] }, 104)"); assert.equal(f.run('overviewRefreshes'), 1); assert.equal(f.run('state.thread.runtimes.length'), 0); assert.equal(f.run('state.overview.agents[0].runtimeId'), 'other-run'); assert.equal(f.requests.length, 0);
+});
+
+test('legacy closure without a runtime id reads authoritative snapshots without clearing a replacement blindly or starting a runtime', async t => {
+  const pending = deferred();
+  const snapshot = { authenticated: true, mode: 'mock', csrf: 'fixture-csrf', upstreamStatus: 'connected', eventCursor: 105, projects: [], pendingApprovals: [], capabilities: { chatCatalog: true, runtimeManagement: true, library: true, allThreads: true } };
+  const f = fixture(t, async url => url === '/api/session' ? response(snapshot) : url === '/api/resume' ? pending.promise : response({ data: [], nextCursor: null })); enableCatalog(f); seedClosingChat(f); f.run('subscribe = () => {}');
+  f.run("handleEvent('relay', { status: 'runtime-closed', threadId: 'closing-chat' }, 105)"); await flush();
+  assert.equal(f.run('state.thread.runtimes[0].runtimeId'), 'run-old'); assert.equal(f.run('state.busy'), true);
+  pending.resolve(response({ thread: { id: 'closing-chat', name: 'Replacement', cwd: '/closing', projectId: null, status: 'active', runtimes: [{ runtimeId: 'run-new', managed: true, status: 'working' }], turns: [{ id: 'turn-new', status: 'inProgress', items: [] }] }, eventCursor: 106 })); await f.run('state.hydrating');
+  assert.equal(f.run('state.thread.runtimes[0].runtimeId'), 'run-new'); assert.equal(f.run('state.busy'), true); assert.equal(f.run('state.turnId'), 'turn-new'); assert.equal(f.requests.filter(request => request.body !== undefined).every(request => request.url === '/api/resume'), true); assert.equal(f.requests.some(request => request.url === '/api/turns' || request.url === '/api/threads' || request.url === '/api/runtimes/join'), false);
+});
+
+test('a closure invalidates an older in-flight Home overview so it cannot restore a dead runtime card', async t => {
+  const pending = deferred(); let reads = 0;
+  const f = fixture(t, async url => { assert.equal(url, '/api/overview'); return ++reads === 1 ? pending.promise : response({ agents: [], metrics: {} }); }); enableCatalog(f); f.run("state.session.capabilities.overview = true; state.view = 'home'");
+  const old = f.run('refreshOverview()'); f.run("handleEvent('relay', { status: 'runtime-closed', runtimeId: 'run-dead', threadId: 'dead-chat' }, 107)"); await flush(); assert.equal(reads, 2);
+  pending.resolve(response({ agents: [{ runtimeId: 'run-dead', threadId: 'dead-chat', name: 'Dead runtime', managed: true, status: 'working' }], metrics: {} })); await old;
+  assert.equal(f.run('state.overview.agents.length'), 0); assert.doesNotMatch(textOf(f.nodes.get('agents')), /Dead runtime/); assert.ok(f.requests.every(request => request.body === undefined));
+});
+
+
+test('a delayed turn POST cannot restart a known turn or restore its runtime after a matching close event', async t => {
+  const pending = deferred(); const f = fixture(t, url => { assert.equal(url, '/api/turns'); return pending.promise; }); enableCatalog(f);
+  f.run("renderThread({ id: 'post-close-chat', cwd: '/closing', projectId: null, status: 'idle', runtimes: [{ runtimeId: 'closed-post-run', managed: true, status: 'idle' }], turns: [] }); $('prompt').value = 'one real task'; controls()"); f.event('composer', 'submit');
+  f.run("rpc({ method: 'turn/started', params: { threadId: 'post-close-chat', turn: { id: 'closed-post-turn' } } }); handleEvent('relay', { status: 'runtime-closed', runtimeId: 'closed-post-run', threadId: 'post-close-chat' }, 108)");
+  assert.equal(f.run('state.busy'), false); assert.equal(f.run('state.turnId'), null); assert.equal(f.run('state.thread.runtimes.length'), 0); assert.equal(f.run('state.activityPhase'), 'closed');
+  pending.resolve(response({ thread: { id: 'post-close-chat', cwd: '/closing', projectId: null, status: 'active', runtimes: [{ runtimeId: 'closed-post-run', managed: true, status: 'working' }] }, runtime: { runtimeId: 'closed-post-run', managed: true, status: 'working' }, turn: { id: 'closed-post-turn', status: 'inProgress', items: [{ id: 'closed-post-user', type: 'userMessage', content: [{ text: 'one real task' }] }] } })); await flush();
+  assert.equal(f.run('state.busy'), false); assert.equal(f.run('state.turnId'), null); assert.equal(f.run('state.thread.runtimes.length'), 0); assert.equal(f.run('state.activityPhase'), 'closed'); assert.equal(f.run('state.activityTimer'), null); assert.equal(f.nodes.get('run-state').dataset.active, 'false');
+  assert.equal(f.run("state.items.get('closed-post-user').text"), 'one real task'); assert.equal(f.run('state.posting'), false); f.run("$('prompt').value = 'next task'; controls()"); assert.equal(f.nodes.get('send').disabled, false); assert.equal(f.requests.length, 1); assert.equal(f.requests[0].body.submissionId, 'ui-submission');
 });

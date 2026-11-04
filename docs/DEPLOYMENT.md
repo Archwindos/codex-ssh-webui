@@ -1,66 +1,123 @@
 # Deployment
 
-This guide runs the gateway and Codex on the same Linux host. Your phone reaches the gateway through its existing SSH forwarding setup. All example paths are placeholders; replace them with paths belonging to your account.
+Run the gateway beside your existing Codex daemon on Linux, then reach its loopback HTTP listener through SSH. Names and paths below are examples; replace them with your installation's values.
 
-## 1. Prepare the host
+中文提示：先确认各客户端使用同一个原生 daemon，再启动网页网关。桌面入口只负责 SSH 隧道；SSH 密码、网页恢复口令与 Codex 账号分别管理。
 
-Use Node.js 24+, OpenSSH, `/usr/bin/tmux`, and the official Codex CLI 0.165.0. Sign in to Codex with ChatGPT as the same OS user that will run the gateway. The WebUI does not provide a ChatGPT login flow or an API-key fallback. See [official authentication documentation](https://learn.chatgpt.com/docs/auth).
+## 1. Prepare the account
 
-Clone or copy this repository to a private, real directory owned by that user. Start in an ordinary SSH shell **outside tmux**. For a fresh checkout:
+You need Linux, Node.js 24+, OpenSSH, and the Codex 0.165.0 build whose protocol you will verify. Codex must already be signed in with ChatGPT as the daemon/gateway account. The WebUI supplies neither a ChatGPT login flow nor an API-key fallback.
+
+Copy or clone the repository to a private directory. From its root:
 
 ```sh
-cd /home/demo/codex-ssh-webui
-chmod 700 .
 umask 077
+chmod 700 .
 install -d -m 700 runtime
-cp config/workspace.example.json config/local.json
-chmod 600 config/local.json
 node --version
-/usr/bin/tmux -V
-/home/demo/.local/bin/codex --version
-/home/demo/.local/bin/codex login status
+command -v codex
+codex --version
+codex login status
 ```
 
-Use your actual Codex executable path in the last two commands. Keep `runtime/`, local configuration, logs, pairing links, and Codex credentials out of Git. Do not share the app directory or use symlinks for its private runtime storage.
+There are no npm dependencies. Keep local configuration, `runtime/`, logs, device records, uploads, and Codex credentials out of Git. Use real directories owned by your account, without symlinks for private runtime storage.
 
-## 2. Configure and verify
+## 2. Identify the shared native daemon
+
+Use the same executable, account, and Codex home as your existing clients. A custom wrapper may select a different home from the shell default; verify its actual configuration first. Do not create a second home as a shortcut to connecting.
+
+The tested 0.165.0 CLI exposes:
+
+```sh
+codex app-server daemon --help
+codex app-server daemon version
+codex app-server proxy --help
+codex resume --help
+```
+
+Reuse a compatible running daemon. For a new installation, after verifying the account and CLI, the native start command is:
+
+```sh
+codex app-server daemon start
+```
+
+Do not run `restart`, `update`, or `stop` merely to attach this gateway. `bootstrap` installs durable daemon management and is a separate operator decision; the WebUI does not require a new startup service.
+
+For the default socket layout, use your existing Codex home:
+
+```sh
+export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_SOCKET="$CODEX_HOME/app-server-control/app-server-control.sock"
+test -S "$CODEX_SOCKET"
+```
+
+Use the daemon's actual socket if its location differs. Keep the control socket private; this guide does not expose it on TCP.
+
+On the server, explicitly attach a CLI to that endpoint:
+
+```sh
+codex --remote "unix://$CODEX_SOCKET"
+codex resume --remote "unix://$CODEX_SOCKET"
+```
+
+The second command opens a resume picker. Choose the intended thread; do not supply a prompt just to check connectivity. Clients implementing app-server stdio can use `codex app-server proxy --sock "$CODEX_SOCKET"` where their own integration supports it. Official desktop-client setup is client-specific and must select this same daemon.
+
+An independent `app-server --stdio` process or CLI using `--no-daemon` is a separate backend. Its saved chats may be readable, but native writer conflicts can prevent continuation. The gateway does not kill or take over that process. Shared mode needs no per-conversation tmux sessions and does not require tmux.
+
+## 3. Configure the gateway
+
+```sh
+cp config/shared-daemon.example.json config/local.json
+chmod 600 config/local.json
+```
 
 Edit `config/local.json`:
 
-- Set `remoteCodex` to your absolute Linux executable path. Despite the field name, `transport: "local"` executes it on this host. The basename must be `codex`; only ASCII letters, digits, `_`, `.`, `-`, and `/` are accepted, without `..` path segments or spaces.
-- Set each project's `cwd`, `workspace.defaultCwd`, and `workspace.roots` to existing directories you intend to expose. The default directory and project directories must be within the roots. Folder selection and project registration stay within those roots.
-- Keep `transport: "local"`, `accessMode: "ssh-loopback-http"`, and `eventTransport: "poll"`. Omit `publicOrigin` and TLS settings in this mode.
-- Keep both `verifiedProtocol.verified` and `verifiedProtocol.schemaVerified` false until verification is complete. The version is pinned to `0.165.0`.
+- Keep `transport: "local"`, `accessMode: "ssh-loopback-http"`, and `eventTransport: "poll"`. Omit `publicOrigin` and TLS fields in this mode.
+- Set `remoteCodex` to the trusted absolute executable path ending in `codex`. Components accept ASCII letters, digits, `_`, `.`, and `-`; spaces and `..` components are not accepted. Shared transport connects to the socket rather than spawning this executable per chat.
+- Set `sharedDaemonSocket` to the verified Unix socket. JSON does not expand `$HOME` or shell variables: enter the actual absolute path.
+- Set `workspace.roots` to the directories you intend the WebUI to admit, and choose an existing `workspace.defaultCwd` within them. Use `/` only if you deliberately intend account-wide browsing and admission.
+- Set the seed project's `cwd` inside those roots. Native projects created in the UI may have no roots or multiple roots. Project membership does not rewrite chat execution directories.
+- Set `temporaryTerminal` to `false` unless you explicitly want the optional interactive shell as this OS account.
+- Leave `verifiedProtocol.verified` and `verifiedProtocol.schemaVerified` false until the next checks are complete. The supported version is `0.165.0`.
 
-Check the exact executable and generate its schema privately:
+Other example configurations describe legacy stdio/SSH transports. Use the shared example for this guide; a private stdio server does not become shared simply by pointing a browser at it.
+
+## 4. Verify compatibility
+
+Generate the installed CLI's schema privately, then run the tests:
 
 ```sh
-/home/demo/.local/bin/codex app-server generate-json-schema --out runtime/protocol-schema
+codex app-server generate-json-schema --out runtime/protocol-schema
 node --test test/*.test.mjs
 ```
 
-The [official app-server documentation](https://learn.chatgpt.com/docs/app-server) explains schema generation and the initialization sequence. Generated schemas describe the installed CLI version; current online examples may describe a newer version.
+Compare the generated requests and responses with `src/shared-rpc.mjs`, `src/server.mjs`, `src/composer.mjs`, `src/projects.mjs`, and `src/library.mjs`. Include initialization, ChatGPT account detection, subscriptions, item pagination, model/effort/profile fields, approvals and questions, native projects, and descendant/archive semantics. Builds with the same version number can expose different fields.
 
-Before enabling production, compare that schema with the requests and responses consumed by `src/protocol.mjs`, `src/server.mjs`, `src/runtimes.mjs`, and `src/library.mjs`. Check initialization, ChatGPT account detection, history pagination, turn events, approvals, and archive/descendant semantics. The local library client opts into `experimentalApi`; review its metadata and descendant-filter fields as well. Tests with the bundled simulator alone do not verify your installed CLI.
+The [official app-server documentation](https://learn.chatgpt.com/docs/app-server) explains the protocol; current online examples may target a newer build. Simulator tests do not verify your daemon.
 
-A no-model handshake checks version and authentication only. Run the configured executable with `app-server`, send the following first, then wait for the response and confirm its `userAgent` reports 0.165.0:
+This probe checks the configured socket, version, and existing ChatGPT sign-in without submitting a model turn:
 
-```json
-{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex_ssh_webui_check","title":"Codex SSH WebUI check","version":"0.1.0"},"capabilities":{"experimentalApi":false}}}
+```sh
+node --input-type=module <<'JS'
+import { readFile } from 'node:fs/promises';
+import { SharedRpcClient } from './src/shared-rpc.mjs';
+const config = JSON.parse(await readFile('config/local.json', 'utf8'));
+const rpc = new SharedRpcClient(config, { mock: false });
+try {
+  await rpc.start();
+  console.log('Shared daemon handshake and ChatGPT account check passed.');
+} finally {
+  rpc.close();
+}
+JS
 ```
 
-Then send these two lines and confirm the account response has `account.type: "chatgpt"`. Keep any account details private, then stop the probe with Ctrl+C.
+It closes only its own connection. It does not prove model access or all lifecycle behavior. After checking the schema and supported behavior, set both verification flags to `true`. If compatibility remains unknown, keep production disabled rather than setting flags solely to clear an error.
 
-```json
-{"method":"initialized","params":{}}
-{"id":2,"method":"account/read","params":{"refreshToken":false}}
-```
+## 5. Start the loopback gateway
 
-Only after the version, schema, and supported behavior have been explicitly checked should you change both verification flags to `true` and enable the environment gate below. If you cannot establish compatibility, leave production disabled. Do not set the flags solely to clear a startup error.
-
-## 3. Start the gateway
-
-Choose a recovery passphrase of at least 32 characters and keep a recoverable copy privately. In Bash, enter it without placing its value in command history or process arguments:
+Choose a recovery passphrase of at least 32 characters and retain a private copy. Enter it in Bash without putting its value in history or process arguments:
 
 ```sh
 read -r -s -p 'Recovery passphrase (32+ characters): ' RELAY_ACCESS_SECRET
@@ -72,28 +129,65 @@ printf '%s\n' "$!" >runtime/gateway.pid
 unset RELAY_ACCESS_SECRET
 ```
 
-This starts only when you run it; no service or scheduled task is installed. Check the private log for startup errors and use `ss -ltn` to confirm the listener is **127.0.0.1:8443**. Preserve the recovery passphrase across restarts. Environment variables are not protection from the same OS account or an administrator.
+`--config` selects production mode; there is no `--production` switch. Preserve the recovery passphrase across restarts. Check the private log and use `ss -ltn` to confirm **127.0.0.1:8443**. This command installs no service or scheduled task.
 
-Run the gateway outside tmux so runtime controls cannot close the gateway's own terminal session. The managed conversations share the account's default tmux server at `/tmp/tmux-<uid>/default`, with independent `codex-chat-...` sessions. Do not use `tmux kill-server` to close an individual conversation.
+The gateway owns its HTTP process and client connection, not the native daemon. Restarting it interrupts browser sessions, rather than stopping daemon-owned tasks. Do not use broad process or tmux kill commands as a gateway shutdown method.
 
-## 4. Connect the phone
+## 6. Connect a desktop or phone
 
-In your phone's SSH client, configure a local forward from **127.0.0.1:8443 on the phone** to **127.0.0.1:8443 on the server**. Keep the tunnel connected, then open `http://127.0.0.1:8443` in that phone's browser. Use the exact hostname and port consistently; browser trust is scoped to the browser profile and origin.
+### Desktop launchers
 
-For comparison, an OpenSSH client with a configured `codex-server` alias uses:
+Keep the complete `scripts/desktop-client` folder and its helpers together. Use this checkout or the repository ZIP; no packaged GitHub Release is required.
+
+On **Windows**, install the native OpenSSH Client optional feature if needed, then double-click `Open WebUI.cmd`. Automatic saved-password entry requires native Windows OpenSSH 8.4+ and PowerShell 5.1+.
+
+On **macOS**, first run this from the repository root, including after extracting a ZIP. The SSH askpass helper also needs its executable bit:
 
 ```sh
-ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8443:127.0.0.1:8443 codex-server
+chmod +x "scripts/desktop-client/Open WebUI.command" \
+  "scripts/desktop-client/Connection settings.command" \
+  scripts/desktop-client/macos-askpass.command \
+  scripts/desktop-client/macos.sh
 ```
 
-That command forwards the port on the device running it. A tunnel on your laptop does not create a loopback port on your phone.
+Then double-click `Open WebUI.command`. macOS automatic password entry requires OpenSSH 8.4+. Running `/bin/bash scripts/desktop-client/macos.sh` is an alternative entry, but the askpass helper still needs executable permission.
 
-Select **使用恢复口令** (Use recovery passphrase) if needed, log in, and use **信任此浏览器** (Trust this browser) in the sidebar for future sign-in. Browser WebCrypto and IndexedDB must be available. Safari, Chrome, private browsing, and different browser profiles do not share trust.
+On first launch:
 
-Optionally, the server owner can issue a single-use pairing link with `scripts/device-pairing.py`; see [SECURITY.md](SECURITY.md). First verify the setup with a disposable workspace: create a conversation, send an intentional test prompt, inspect approval handling, reload history, and close its runtime. Any model turn uses the signed-in account.
+1. Enter the server address or SSH alias, SSH port, username, SSH password, and local/server gateway ports. Both gateway ports default to `8443`; the SSH port is separate.
+2. Verify a first-connection host-key fingerprint through a trusted source before accepting it.
+3. Once tunnel and gateway checks pass, the launcher opens the browser. Complete web login separately.
 
-## Alternative: SSH transport
+Windows saves connection settings with current-user DPAPI and restricted ACLs; macOS uses that user's Keychain. Helpers do not save a plain-text password configuration, install Codex, or modify server startup settings.
 
-`config/ssh-loopback-http.example.json` launches Codex through OpenSSH using fixed project directories. Configure its `sshTarget` as a trusted SSH config alias, such as `codex-server`; accepted aliases start with a letter or digit and contain only letters, digits, `_`, `.`, and `-`. Direct `user@host` values and SSH options are not accepted. Host-key checking and noninteractive SSH authentication remain enabled.
+Use `Connection settings.cmd` or `Connection settings.command` to replace saved settings. To forget only this launcher's local credentials:
 
-This alternative does not provide the local workspace runtime/library management described above. The browser-facing connection remains a loopback SSH forward. Apply the same protocol verification and web authentication requirements.
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/desktop-client/windows.ps1 -ForgetCredentials
+```
+
+```sh
+/bin/bash scripts/desktop-client/macos.sh --forget-credentials
+```
+
+Keep the connection window open or minimized. Closing it disconnects that device's tunnel; server tasks remain with the native daemon. If SSH exits or the network fails, relaunch manually. The launcher does not replay model messages. Windows has native checks and the scripts have fixture tests; the complete macOS Keychain/Terminal/browser workflow still needs verification on a real Mac.
+
+### Phone or manual forwarding
+
+In a phone SSH app, forward **127.0.0.1:8443 on the phone** to **127.0.0.1:8443 on the server**, keep the tunnel active, and open <http://127.0.0.1:8443> in that phone's browser.
+
+An OpenSSH client with a configured example alias uses:
+
+```sh
+ssh -N -T -o ExitOnForwardFailure=yes -L 127.0.0.1:8443:127.0.0.1:8443 codex-server
+```
+
+A laptop forward does not create a loopback port on a phone. Use the same browser origin and port consistently; browser trust is scoped to that origin and profile.
+
+Log in with the recovery passphrase, then select **信任此浏览器** (Trust this browser). WebCrypto and IndexedDB must be available. Optional single-use enrollment links are described in [SECURITY.md](SECURITY.md).
+
+## 7. Accept the installation
+
+Use a disposable workspace and a new test conversation. Intentionally send a small task, inspect it from two clients connected to the same daemon, reload paginated history, and verify reconnect without resending. Check an image and text attachment if needed. Test lifecycle actions only on disposable chats and projects after reviewing their impact previews.
+
+Any model turn uses the signed-in account. A handshake, passing fixtures, or an open browser alone is not end-to-end acceptance. Keep credentials and private conversations out of screenshots and reports.

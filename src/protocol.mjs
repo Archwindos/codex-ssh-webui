@@ -7,7 +7,7 @@ export class RelayError extends Error {
   constructor(status, code, message) { super(message); this.status = status; this.code = code; }
 }
 export function fail(status, code, message) { throw new RelayError(status, code, message); }
-export const METHODS = new Set(['initialize', 'account/read', 'thread/start', 'thread/resume', 'thread/read', 'thread/list', 'thread/turns/list', 'thread/items/list', 'thread/archive', 'turn/start', 'turn/interrupt']);
+export const METHODS = new Set(['initialize', 'account/read', 'model/list', 'config/read', 'permissionProfile/list', 'project/list', 'project/read', 'project/create', 'project/update', 'project/move', 'project/delete', 'threadSection/list', 'thread/name/set', 'thread/metadata/update', 'thread/section/move', 'thread/start', 'thread/resume', 'thread/read', 'thread/list', 'thread/turns/list', 'thread/items/list', 'thread/archive', 'turn/start', 'turn/interrupt']);
 export const APPROVALS = new Set(['item/commandExecution/requestApproval', 'item/fileChange/requestApproval']);
 // Empty sourceKinds means interactive-only in the verified 0.165 protocol.
 export const THREAD_SOURCE_KINDS = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'];
@@ -156,7 +156,23 @@ export function safeItem(item) {
   if (!item || typeof item !== 'object') return { type: 'unknown', id: '' };
   const result = { id: text(item.id, 200), type: text(item.type, 80) };
   if (item.type === 'agentMessage' || item.type === 'plan') { result.text = text(item.text); result.truncated = typeof item.text === 'string' && item.text.length > 20000; if (['commentary', 'partial_answer', 'final_answer'].includes(item.phase)) result.phase = item.phase; }
-  else if (item.type === 'userMessage') result.content = (Array.isArray(item.content) ? item.content : []).filter(x => x.type === 'text').map(x => ({ type: 'text', text: text(x.text) }));
+  else if (item.type === 'userMessage') {
+    const attachments = [], prefix = '用户上传的附件；可按本次任务需要读取以下本地文件：\n';
+    result.content = (Array.isArray(item.content) ? item.content : []).filter(x => x?.type === 'text').flatMap(part => {
+      let content = typeof part.text === 'string' ? part.text : '', index = content.indexOf(prefix);
+      if (index >= 0) {
+        try {
+          const lines = content.slice(index + prefix.length).split('\n').filter(line => line.trim());
+          if (!lines.length || lines.length > 5) throw Error('Not attachment metadata');
+          const files = lines.map(line => JSON.parse(line));
+          if (files.some(file => !file || Object.keys(file).sort().join(',') !== 'mimeType,name,path,size' || typeof file.name !== 'string' || !file.name || file.name.length > 200 || /[\u0000-\u001f\u007f]/.test(file.name) || typeof file.path !== 'string' || !file.path || typeof file.mimeType !== 'string' || file.mimeType.length > 200 || !Number.isSafeInteger(file.size) || file.size < 0 || file.size > 10 * 1024 * 1024)) throw Error('Not attachment metadata');
+          attachments.push(...files.map(file => ({ name: file.name, mimeType: file.mimeType, size: file.size }))); content = content.slice(0, index);
+        } catch { /* Ordinary user text is never discarded by a prefix alone. */ }
+      }
+      return content ? [{ type: 'text', text: text(content) }] : [];
+    });
+    if (attachments.length) result.attachments = attachments;
+  }
   else if (item.type === 'reasoning') { result.summary = textParts(item.summary); result.content = textParts(item.content); result.truncated = [item.summary, item.content].some(parts => Array.isArray(parts) && (parts.length > 100 || parts.reduce((total, part) => total + (typeof part === 'string' ? part.length : 0), 0) > 20000)); }
   else if (item.type === 'commandExecution') { result.command = text(item.command, 2000); result.cwd = text(item.cwd, 1000); result.status = text(item.status, 80); result.aggregatedOutput = text(item.aggregatedOutput); result.truncated = typeof item.aggregatedOutput === 'string' && item.aggregatedOutput.length > 20000; result.exitCode = Number.isInteger(item.exitCode) ? item.exitCode : null; }
   else if (item.type === 'fileChange') { result.status = text(item.status, 80); result.changes = (Array.isArray(item.changes) ? item.changes : []).slice(0, 100).map(x => ({ path: text(x.path, 1000), kind: text(typeof x.kind === 'string' ? x.kind : x.kind?.type, 80), diff: text(x.diff) })); }
@@ -165,5 +181,18 @@ export function safeItem(item) {
   else if (item.type === 'collabAgentToolCall') { result.tool = text(item.tool, 100); result.status = text(item.status, 80); result.senderThreadId = text(item.senderThreadId, 200); result.receiverThreadIds = (Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : []).slice(0, 100).map(id => text(id, 200)); }
   return result;
 }
-export function safeTurn(turn) { return { id: text(turn?.id, 200), status: text(turn?.status, 80), items: (Array.isArray(turn?.items) ? turn.items : []).slice(0, 500).map(safeItem) }; }
-export function safeThread(thread) { return { id: text(thread?.id, 200), cwd: text(thread?.cwd, 4096), preview: text(thread?.preview, 500), name: text(thread?.name, 200), status: safeThreadStatus(thread?.status), createdAt: Number.isSafeInteger(thread?.createdAt) ? thread.createdAt : null, updatedAt: Number.isSafeInteger(thread?.updatedAt) ? thread.updatedAt : null, parentThreadId: text(thread?.parentThreadId || thread?.source?.subAgent?.thread_spawn?.parent_thread_id, 200) || null, forkedFromId: text(thread?.forkedFromId, 200) || null, source: safeSource(thread?.source), turns: (Array.isArray(thread?.turns) ? thread.turns : []).slice(-100).map(safeTurn) }; }
+export const MAX_SAFE_TURN_ITEMS = 10000;
+export const MAX_HISTORY_BYTES = 16 * 1024 * 1024;
+export function safeTurn(turn) {
+  if (turn?.items !== undefined && !Array.isArray(turn.items)) fail(502, 'protocol_mismatch', '历史项目格式无效。');
+  const source = turn?.items || [];
+  if (source.length > MAX_SAFE_TURN_ITEMS) fail(413, 'history_limit', '历史记录超出单次读取上限，未返回不完整内容。');
+  const items = []; let bytes = 0;
+  for (const raw of source) {
+    const item = safeItem(raw); bytes += Buffer.byteLength(JSON.stringify(item), 'utf8') + 1;
+    if (bytes > MAX_HISTORY_BYTES) fail(413, 'history_limit', '历史记录超出单次读取上限，未返回不完整内容。');
+    items.push(item);
+  }
+  return { id: text(turn?.id, 200), status: text(turn?.status, 80), items, ...(['notLoaded', 'summary', 'full'].includes(turn?.itemsView) ? { itemsView: turn.itemsView } : {}) };
+}
+export function safeThread(thread) { return { id: text(thread?.id, 200), cwd: text(thread?.cwd, 4096), preview: text(thread?.preview, 500), name: text(thread?.name, 200), projectId: text(thread?.projectId, 200) || null, section: thread?.section && typeof thread.section.id === 'string' ? { id: text(thread.section.id, 200), name: text(thread.section.name, 200), appearance: thread.section.appearance && typeof thread.section.appearance === 'object' ? { icon: text(thread.section.appearance.icon, 100) || null, color: text(thread.section.appearance.color, 100) || null } : null } : null, pinned: thread?.section?.id === '01984de2-8f74-7c91-a3b2-5c5e937cf318', sectionEnteredAt: Number.isSafeInteger(thread?.sectionEnteredAt) ? thread.sectionEnteredAt : null, recencyAt: Number.isSafeInteger(thread?.recencyAt) ? thread.recencyAt : null, status: safeThreadStatus(thread?.status), createdAt: Number.isSafeInteger(thread?.createdAt) ? thread.createdAt : null, updatedAt: Number.isSafeInteger(thread?.updatedAt) ? thread.updatedAt : null, parentThreadId: text(thread?.parentThreadId || thread?.source?.subAgent?.thread_spawn?.parent_thread_id, 200) || null, forkedFromId: text(thread?.forkedFromId, 200) || null, source: safeSource(thread?.source), turns: (Array.isArray(thread?.turns) ? thread.turns : []).slice(-100).map(safeTurn) }; }

@@ -1,0 +1,44 @@
+.temporary-terminal {
+  --terminal-ground: #14212d;
+  --terminal-ink: #e4edf4;
+  --terminal-muted: #b2c4d3;
+  box-sizing: border-box;
+  width: min(1080px, calc(100vw - 32px));
+  height: min(760px, calc(100dvh - 48px));
+  max-width: none;
+  max-height: none;
+  padding: 0;
+  border: 1px solid #536d82;
+  border-radius: 12px;
+  color: var(--terminal-ink);
+  background: var(--terminal-ground);
+  overflow: hidden;
+  color-scheme: dark;
+}
+.temporary-terminal[open] { display: flex; flex-direction: column; }
+.temporary-terminal::backdrop { background: rgb(12 31 46 / 62%); }
+.terminal-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px 0; flex: none; }
+.terminal-header h2 { margin: 0; font-size: 17px; line-height: 1.5; font-weight: 600; }
+.temporary-terminal button { min-height: 36px; border: 1px solid #6a8499; border-radius: 6px; padding: 5px 12px; background: #233c50; color: var(--terminal-ink); font: inherit; font-size: 13px; cursor: pointer; }
+.temporary-terminal button:hover { background: #30516a; }
+.temporary-terminal button:focus-visible { outline: 2px solid #9ecbff; outline-offset: 3px; }
+.temporary-terminal button:disabled { opacity: .55; cursor: wait; }
+.terminal-status { margin: 8px 18px 10px; color: var(--terminal-muted); font-size: 12px; line-height: 1.5; flex: none; }
+.terminal-status.is-error { color: #ffb8a8; }
+.terminal-surface { flex: 1; min-height: 0; margin: 0 10px 0 18px; overflow: hidden; }
+.terminal-surface .xterm { height: 100%; }
+.terminal-surface .xterm-viewport { scrollbar-color: #536d82 #14212d; scrollbar-width: thin; }
+.terminal-surface ::selection { color: #fff; background: #365572; }
+.terminal-keys { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 18px 0; flex: none; }
+.terminal-keys .terminal-key { min-width: 44px; font-family: Consolas, "SFMono-Regular", Menlo, monospace; touch-action: manipulation; }
+.terminal-keys .terminal-resume { background: #31536d; }
+.terminal-note { margin: 10px 18px 14px; font-size: 11px; line-height: 1.5; color: var(--terminal-muted); flex: none; }
+@media (max-width: 600px) {
+  .temporary-terminal { width: 100vw; height: 100dvh; margin: 0; border: 0; border-radius: 0; }
+  .terminal-header { padding: max(12px, env(safe-area-inset-top)) 12px 0; }
+  .terminal-status { margin-left: 12px; margin-right: 12px; }
+  .terminal-surface { margin-left: 8px; margin-right: 4px; }
+  .terminal-keys { padding-left: 12px; padding-right: 12px; gap: 6px; }
+  .temporary-terminal button { min-height: 40px; }
+  .terminal-note { margin: 9px 12px max(12px, env(safe-area-inset-bottom)); }
+}

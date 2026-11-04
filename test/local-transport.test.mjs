@@ -11,13 +11,13 @@ import { startRuntimeWorker } from '../src/runtime-worker.mjs';
 
 const config = {
   transport: 'local',
-  remoteCodex: '/home/demo/.local/bin/codex',
+  remoteCodex: '/opt/codex/bin/codex',
   publicOrigin: 'https://relay.test.example',
   projects: [{ id: 'home', name: 'Home', cwd: '/workspace' }],
   verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true }
 };
 const env = { RELAY_ACCESS_SECRET: 'TEST_ONLY_NEVER_FOR_DEPLOYMENT_1234567890', RELAY_VERIFIED_PROTOCOL: '0.165.0' };
-const sshArgs = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=10', '--', 'codex-server', 'exec /home/demo/.local/bin/codex app-server'];
+const sshArgs = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=10', '--', 'codex-server', 'exec /opt/codex/bin/codex app-server'];
 
 function upstream(options = {}) {
   const child = new EventEmitter();
@@ -51,7 +51,7 @@ test('local production launches only the configured official app-server with a m
   t.after(() => rpc.close()); validateProduction(config, env); await rpc.start();
   assert.equal(rpc.connected, true); assert.equal(fixture.calls.length, 1);
   const [command, args, options] = fixture.calls[0];
-  assert.equal(command, '/home/demo/.local/bin/codex'); assert.deepEqual(args, ['app-server']);
+  assert.equal(command, '/opt/codex/bin/codex'); assert.deepEqual(args, ['app-server']);
   assert.deepEqual(options.stdio, ['pipe', 'pipe', 'pipe']); assert.equal(options.windowsHide, true); assert.equal(options.shell, undefined);
   const keys = ['PATH', 'Path', 'SystemRoot', 'WINDIR', 'USERPROFILE', 'HOME', 'TEMP', 'TMP'];
   assert.deepEqual(options.env, Object.fromEntries(keys.filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]])));
@@ -131,7 +131,7 @@ test('runtime worker rejects the same unsafe path and unverified protocol before
 });
 
 test('public configuration examples retain false verification flags and fail closed before execution', async () => {
-  for (const name of ['workspace', 'ssh-loopback-http']) {
+  for (const name of ['workspace', 'ssh-loopback-http', 'shared-daemon']) {
     const example = JSON.parse(await readFile(new URL(`../config/${name}.example.json`, import.meta.url), 'utf8'));
     assert.equal(example.verifiedProtocol.verified, false); assert.equal(example.verifiedProtocol.schemaVerified, false);
     assert.equal(example.projects[0].cwd, '/workspace');

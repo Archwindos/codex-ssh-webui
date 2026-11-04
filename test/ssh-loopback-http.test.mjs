@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import vm from 'node:vm';
 import { createRelay, validateConfig } from '../src/server.mjs';
 
-const config = { accessMode: 'ssh-loopback-http', transport: 'local', remoteCodex: '/home/demo/.local/bin/codex', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true }, projects: [{ id: 'acceptance', name: 'Acceptance', cwd: '/isolated/acceptance' }] };
+const config = { accessMode: 'ssh-loopback-http', transport: 'local', remoteCodex: '/opt/codex/bin/codex', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true }, projects: [{ id: 'acceptance', name: 'Acceptance', cwd: '/isolated/acceptance' }] };
 const env = { RELAY_ACCESS_SECRET: 'TEST_ONLY_NEVER_DEPLOY_12345678901234567890', RELAY_VERIFIED_PROTOCOL: '0.165.0' };
 const localOrigin = 'http://127.0.0.1:59119';
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -292,8 +292,12 @@ test('HTTP browser uses one bearer/header policy for session, login, APIs, polli
 test('browser submission IDs keep secure randomness when randomUUID is unavailable', async t => {
   let bytes = 0;
   const browser = await browserFixture(t, async () => assert.fail('No request expected'), new Map(), { getRandomValues(array) { bytes += array.length; return webcrypto.getRandomValues(array); } });
+  const pageBytes = bytes;
+  assert.equal(pageBytes, 16, 'the page presence id consumes one secure 16-byte allocation');
+  assert.match(browser.run('runtimePresence.clientId'), /^[a-f0-9]{32}$/);
   const ids = new Set(Array.from({ length: 100 }, () => browser.run('submissionId()')));
-  assert.equal(ids.size, 100); assert.equal(bytes, 1600); for (const id of ids) assert.match(id, /^[a-f0-9]{32}$/);
-  const unavailable = await browserFixture(t, async () => assert.fail('No request expected'), new Map(), {});
-  assert.throws(() => unavailable.run('submissionId()'));
+  assert.equal(ids.size, 100); assert.equal(bytes - pageBytes, 1600); for (const id of ids) assert.match(id, /^[a-f0-9]{32}$/);
+  browser.run('crypto.getRandomValues = undefined');
+  assert.throws(() => browser.run('submissionId()'));
+  await assert.rejects(browserFixture(t, async () => assert.fail('No request expected'), new Map(), {}), /getRandomValues/);
 });

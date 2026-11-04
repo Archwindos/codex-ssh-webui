@@ -3,7 +3,17 @@
   "eventTransport": "poll",
   "transport": "ssh",
   "sshTarget": "codex-server",
-  "remoteCodex": "/home/demo/.local/bin/codex",
-  "projects": [{ "id": "workspace", "name": "Workspace", "cwd": "/workspace" }],
-  "verifiedProtocol": { "version": "0.165.0", "verified": false, "schemaVerified": false }
+  "remoteCodex": "/opt/codex/bin/codex",
+  "projects": [
+    {
+      "id": "workspace",
+      "name": "Workspace",
+      "cwd": "/workspace"
+    }
+  ],
+  "verifiedProtocol": {
+    "version": "0.165.0",
+    "verified": false,
+    "schemaVerified": false
+  }
 }

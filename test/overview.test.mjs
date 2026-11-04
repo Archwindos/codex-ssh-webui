@@ -6,7 +6,7 @@ test('tmux metadata parses real IDs and never substitutes an operating-system PI
   const [pane] = parseTmuxPanes('$3|work|1|2|%7|400\n');
   assert.deepEqual(pane, { sessionId: '$3', sessionName: 'work', windowIndex: 1, paneIndex: 2, paneId: '%7', panePid: 400, target: '$3:1.2' });
   assert.equal(parseTmuxPanes('$3|work|with|separator|1|2|%7|400')[0].sessionName, 'work|with|separator');
-  for (const line of ['3|work|1|2|%7|400', '$3|work|bad|2|%7|400', '$3|work|1|2|7|400', '$3|work|1|2|%7|0', '$3|work|1|2|%7|400|extra', '$0_codex-ssh-webui-private_0_0_%0_2565736']) assert.deepEqual(parseTmuxPanes(line), []);
+  for (const line of ['3|work|1|2|%7|400', '$3|work|bad|2|%7|400', '$3|work|1|2|7|400', '$3|work|1|2|%7|0', '$3|work|1|2|%7|400|extra', '$0_codex-mobile-relay-private_0_0_%0_2565736']) assert.deepEqual(parseTmuxPanes(line), []);
 });
 
 const pane = parseTmuxPanes('$3|work|1|2|%7|400')[0];
@@ -64,6 +64,16 @@ test('only explicit task events determine activity for an observed live rollout'
   assert.equal(rolloutActivity(head, `${event('task_started')}\n${event('task_complete')}`).status, 'idle');
   assert.equal(rolloutActivity(head, event('agent_message')).status, 'unknown');
   assert.equal(rolloutActivity('{}', event('task_started')), null);
+});
+
+test('rollout activity uses the latest saved turn working directory', () => {
+  const head = JSON.stringify({ type: 'session_meta', payload: { id: 'thread-1', cwd: '/original' } });
+  const tail = [
+    { type: 'turn_context', payload: { cwd: '/current' } },
+    { type: 'turn_context', payload: { cwd: '../invalid' } },
+    { type: 'event_msg', payload: { type: 'task_complete' } }
+  ].map(JSON.stringify).join('\n');
+  assert.deepEqual(rolloutActivity(head, tail), { threadId: 'thread-1', cwd: '/current', status: 'idle' });
 });
 
 test('overview merges live processes with relay state, caches and coalesces collection', async () => {

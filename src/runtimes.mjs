@@ -20,6 +20,8 @@ const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 const tmuxFormat = '#{pid}|#{session_id}|#{session_name}|#{window_id}|#{window_index}|#{pane_id}|#{pane_index}|#{pane_pid}';
 const safeEnvironment = env => Object.fromEntries(['HOME', 'PATH', 'LANG', 'LC_ALL'].filter(key => typeof env[key] === 'string').map(key => [key, env[key]]));
 const errorOf = (error, fallback = 'runtime_unavailable') => ({ status: error?.status || 503, code: error?.code || fallback, message: '运行连接不可用；提交结果可能未知，请检查历史，勿自动重发。' });
+export const WEB_PRESENCE_LEASE_MS = 90000;
+const presenceClientOK = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 export const approvalId = (runId, id) => `${runId}:${Buffer.from(JSON.stringify(id)).toString('base64url')}`;
 
 export function parseRuntimePane(output) {
@@ -31,8 +33,8 @@ export function parseRuntimePane(output) {
 }
 
 // Only this narrow platform layer touches Linux processes, tmux and private IPC.
-export function createRuntimePlatform({ root = ROOT, filesystem = fs, exec = execute, env = process.env, uid = () => process.getuid(), pid = () => process.pid, node = process.execPath, recoveryMutex } = {}) {
-  const runsRoot = join(root, 'runtime', 'runs'), lockRoot = join(root, 'runtime', 'thread-locks'), freezeRoot = join(root, 'runtime', 'thread-freezes');
+export function createRuntimePlatform({ root = ROOT, filesystem = fs, exec = execute, env = process.env, uid = () => process.getuid(), pid = () => process.pid, node = process.execPath, clock = Date.now, recoveryMutex } = {}) {
+  const runsRoot = join(root, 'runtime', 'runs'), lockRoot = join(root, 'runtime', 'thread-locks'), freezeRoot = join(root, 'runtime', 'thread-freezes'), preferencesRoot = join(root, 'runtime', 'thread-preferences');
   const socketPath = () => `/tmp/tmux-${uid()}/default`;
   const privatePath = async (path, kind, mode) => {
     const info = await filesystem.lstat(path);
@@ -55,19 +57,31 @@ export function createRuntimePlatform({ root = ROOT, filesystem = fs, exec = exe
     await filesystem.writeFile(temporary, data, { flag: 'wx', mode: 0o600 });
     try { await filesystem.rename(temporary, path); } finally { await filesystem.unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
   };
-  const getProcess = async pid => {
+  const processRelation = async pid => {
+    const folder = `/proc/${pid}`, info = await filesystem.stat(folder);
+    if (info.uid !== uid()) fail(409, 'runtime_process_owner', '运行进程所有者不匹配。');
+    const text = await filesystem.readFile(`${folder}/stat`, 'utf8'), end = text.lastIndexOf(')'), fields = text.slice(end + 2).trim().split(/\s+/);
+    if (end < 0 || !/^\d+$/.test(fields[19] || '') || !fields.slice(1, 5).every(value => /^-?\d+$/.test(value) && Number.isSafeInteger(Number(value))) || fields.slice(1, 4).some(value => Number(value) < 0)) fail(409, 'runtime_identity', '进程关系身份无法核对。');
+    if (fields[0] === 'Z') return null;
+    return { pid, ppid: Number(fields[1]), pgid: Number(fields[2]), sid: Number(fields[3]), tty: Number(fields[4]), startTicks: fields[19] };
+  };
+  const getProcess = async (pid, { allowIdentityUnavailable = false } = {}) => {
     try {
-      const folder = `/proc/${pid}`, info = await filesystem.stat(folder);
-      if (info.uid !== uid()) fail(409, 'runtime_process_owner', '运行进程所有者不匹配。');
-      const parse = text => { const end = text.lastIndexOf(')'), fields = text.slice(end + 2).trim().split(/\s+/); if (end < 0 || !/^\d+$/.test(fields[19] || '')) throw Error('stat'); return fields; };
-      const fields = parse(await filesystem.readFile(`${folder}/stat`, 'utf8'));
-      if (fields[0] === 'Z') return null;
-      const executable = await filesystem.readlink(`${folder}/exe`), raw = await filesystem.readFile(`${folder}/cmdline`);
+      const folder = `/proc/${pid}`, relation = await processRelation(pid);
+      if (!relation) return null;
+      let executable, raw;
+      try { executable = await filesystem.readlink(`${folder}/exe`); raw = await filesystem.readFile(`${folder}/cmdline`); }
+      catch (error) {
+        if (!allowIdentityUnavailable || !['EACCES', 'EPERM'].includes(error.code)) throw error;
+        // Non-dumpable same-UID processes may hide exe/cmdline. Keep their
+        // relationship identity; unreadable or changed stat remains an error.
+        if (!same(relation, await processRelation(pid))) fail(409, 'runtime_identity', '不可读进程的关系身份已改变。');
+        return { ...relation, identityUnavailable: true };
+      }
       if (raw[raw.length - 1] !== 0) throw Error('cmdline');
       const commandline = raw.subarray(0, -1).toString('utf8').split('\0');
-      const again = parse(await filesystem.readFile(`${folder}/stat`, 'utf8'));
-      if (fields[19] !== again[19]) fail(409, 'runtime_identity', '进程身份已改变。');
-      return { pid, ppid: Number(fields[1]), pgid: Number(fields[2]), sid: Number(fields[3]), startTicks: fields[19], executable, commandline };
+      if (!same(relation, await processRelation(pid))) fail(409, 'runtime_identity', '进程身份已改变。');
+      return { ...relation, executable, commandline };
     } catch (error) { if (['ENOENT', 'ESRCH'].includes(error.code)) return null; throw error; }
   };
   const processMatches = (expected, actual) => actual && ['pid', 'startTicks', 'executable'].every(key => expected[key] === actual[key]) && same(expected.commandline, actual.commandline);
@@ -194,14 +208,73 @@ export function createRuntimePlatform({ root = ROOT, filesystem = fs, exec = exe
     if (!idOK(threadId) || !sameOwner(await maybeJSON(lockPath(threadId)), owner)) fail(409, 'thread_writer_changed', '会话运行写入者已改变。');
     await assertUnfrozen(threadId);
   };
+  const preference = async threadId => {
+    if (!idOK(threadId)) fail(400, 'invalid_thread', '会话 id 无效。');
+    const value = await maybeJSON(join(preferencesRoot, `${threadId}.json`));
+    if (value && (value.schemaVersion !== 1 || value.threadId !== threadId || typeof value.keepRunning !== 'boolean')) fail(409, 'runtime_preference_unknown', '会话运行偏好无法核对。');
+    return { threadId, keepRunning: value?.keepRunning ?? false };
+  };
+  const presencePath = join(root, 'runtime', 'web-presence.json');
+  const readPresence = async () => {
+    const value = await maybeJSON(presencePath);
+    if (!value) return [];
+    if (value.schemaVersion !== 1 || !Array.isArray(value.leases) || value.leases.length > 1000 || value.leases.some(lease => !presenceClientOK(lease?.clientId) || !idOK(lease.threadId) || !Number.isSafeInteger(lease.expiresAt) || lease.expiresAt < 0) || new Set(value.leases.map(lease => lease.clientId)).size !== value.leases.length) fail(409, 'runtime_presence_unknown', '网页连接记录无法核对，不会自动回收。');
+    return value.leases;
+  };
+  const webPresence = async threadId => {
+    if (!idOK(threadId)) fail(400, 'invalid_thread', '会话 id 无效。');
+    return { threadId, connected: (await readPresence()).some(lease => lease.threadId === threadId && lease.expiresAt > clock()), leaseMs: WEB_PRESENCE_LEASE_MS };
+  };
+  const processes = async () => {
+    const result = [];
+    for (const name of await filesystem.readdir('/proc')) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        if ((await filesystem.stat(`/proc/${name}`)).uid !== uid()) continue;
+        const entry = await getProcess(Number(name), { allowIdentityUnavailable: true });
+        if (entry) result.push(entry);
+      } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
+    }
+    return result;
+  };
+  const cleanupIdentity = async receipt => {
+    if (!await verify(receipt)) fail(409, 'runtime_identity', '运行身份无法核对，不会回收。');
+    const listed = await tmux(['list-panes', '-s', '-t', receipt.tmux.sessionId, '-F', tmuxFormat]);
+    if (listed.code || listed.stderr || listed.stdout.trim().split('\n').length !== 1) fail(409, 'runtime_shared', '运行区含其他窗格，不会自动回收。');
+    const pane = parseRuntimePane(listed.stdout);
+    if (['serverPid', 'sessionId', 'sessionName', 'windowId', 'paneId', 'panePid'].some(key => pane[key] !== receipt.tmux[key])) fail(409, 'runtime_identity', '运行区身份已改变。');
+    const attached = await tmux(['display-message', '-p', '-t', receipt.tmux.sessionId, '#{session_attached}']);
+    if (attached.code || attached.stderr || !/^0\s*$/.test(attached.stdout)) fail(409, 'runtime_attached', '终端已连接或连接状态未知，不会自动回收。');
+    const all = await processes(), descendants = new Set([receipt.worker.pid]);
+    for (let changed = true; changed;) { changed = false; for (const entry of all) if (descendants.has(entry.ppid) && !descendants.has(entry.pid)) { descendants.add(entry.pid); changed = true; } }
+    const ownedIds = new Set([receipt.worker.pid, receipt.codex.pid]);
+    if (!all.some(entry => processMatches(receipt.worker, entry)) || !all.some(entry => processMatches(receipt.codex, entry)) || [...descendants].some(pid => !ownedIds.has(pid)) || all.some(entry => !ownedIds.has(entry.pid) && (entry.sid === receipt.worker.sid || receipt.worker.tty !== 0 && entry.tty === receipt.worker.tty))) fail(409, 'runtime_child_process', '运行进程树或终端会话有其他命令，不会自动回收。');
+    return { pane, identities: all.filter(entry => descendants.has(entry.pid)) };
+  };
   return {
-    root, runsRoot, readJSON, writeJSON, getProcess, processMatches, verify, tmux, serverState, admission,
+    root, runsRoot, readJSON, writeJSON, getProcess, processMatches, verify, tmux, serverState, admission, processes, cleanupIdentity,
+    getKeepRunning: preference,
+    getWebPresence: webPresence,
+    async setWebPresence(clientId, threadId) {
+      if (!presenceClientOK(clientId) || (threadId !== null && !idOK(threadId))) fail(400, 'invalid_presence', '网页连接标识或会话无效。');
+      return admission(async () => {
+        const now = clock(), leases = (await readPresence()).filter(lease => lease.expiresAt > now && lease.clientId !== clientId);
+        if (threadId !== null) { if (leases.length >= 1000) fail(429, 'runtime_presence_limit', '网页连接记录已满，请稍后重试。'); leases.push({ clientId, threadId, expiresAt: now + WEB_PRESENCE_LEASE_MS }); }
+        await writeJSON(presencePath, { schemaVersion: 1, leases });
+        return { threadId, connected: threadId !== null, leaseMs: WEB_PRESENCE_LEASE_MS };
+      });
+    },
+    async setKeepRunning(threadId, keepRunning) {
+      if (typeof keepRunning !== 'boolean') fail(400, 'invalid_preference', '持续运行设置无效。');
+      return admission(async () => { await preference(threadId); await writeJSON(join(preferencesRoot, `${threadId}.json`), { schemaVersion: 1, threadId, keepRunning }); return { threadId, keepRunning }; });
+    },
+    async cleanupAdmitted(threadId, owner, operation) { return admission(async () => { await assertLock(threadId, owner); if ((await preference(threadId)).keepRunning) fail(409, 'runtime_keep_running', '会话已设置持续运行。'); if ((await webPresence(threadId)).connected) fail(409, 'runtime_web_connected', '网页仍连接此会话，不会自动回收。'); return operation(); }); },
     async secureSocket(path) { await filesystem.chmod(path, 0o600); await privatePath(path, 'isSocket', 0o600); },
     runDir: id => { if (!runOK(id)) fail(400, 'invalid_run', '运行 id 无效。'); return join(runsRoot, id); },
     async initialize() {
       if (process.platform !== 'linux' && filesystem === fs) fail(503, 'runtime_platform', '独立运行区需要 Linux 默认 tmux 服务。');
       await privateDirectory(root); await privateDirectory(join(root, 'runtime'));
-      for (const path of [runsRoot, lockRoot, freezeRoot]) { await filesystem.mkdir(path, { mode: 0o700 }).catch(error => { if (error.code !== 'EEXIST') throw error; }); await privateDirectory(path); }
+      for (const path of [runsRoot, lockRoot, freezeRoot, preferencesRoot]) { await filesystem.mkdir(path, { mode: 0o700 }).catch(error => { if (error.code !== 'EEXIST') throw error; }); await privateDirectory(path); }
       // Explicit -S bypasses tmux's ordinary creation of its default directory.
       // Create only this standard UID directory; never chmod an existing one.
       const directory = dirname(socketPath());
@@ -230,16 +303,38 @@ export function createRuntimePlatform({ root = ROOT, filesystem = fs, exec = exe
       let worker;
       for (let n = 0; n < 40; n++) { worker = await getProcess(pane.panePid); if (worker?.executable === node && same(worker.commandline, commandline)) break; worker = null; await delay(50); }
       if (!worker) fail(409, 'runtime_identity', '新 runner 进程身份无法核对。');
-      const receipt = { schemaVersion: 1, id, root, cwd: launch.params.cwd || null, threadId: null, createdAt: Date.now(), worker, codex: null, tmux: { ...server, ...pane } };
+      const receipt = { schemaVersion: 1, id, root, cwd: launch.params.cwd || null, threadId: null, createdAt: clock(), worker, codex: null, tmux: { ...server, ...pane } };
       await writeJSON(join(directory, 'receipt.json'), receipt, true);
       return receipt;
     },
     async readReceipt(id) { return validReceipt(await readJSON(join(this.runDir(id), 'receipt.json'))); },
+    async reconcileAbsent(receipt) {
+      return admission(async () => {
+        validReceipt(receipt);
+        if (![1, 2].includes(receipt.lifecycle?.version) || receipt.closed || !receipt.threadId) return false;
+        await assertUnfrozen(receipt.threadId);
+        for (const expected of [receipt.worker, receipt.codex].filter(Boolean)) if ((await getProcess(expected.pid))?.startTicks === expected.startTicks) return false;
+        // A dead runner is not evidence that a surviving pane is disposable.
+        // Only reconcile a proven missing owned pane; never touch tmux here.
+        const server = await serverState(receipt.tmux, true);
+        if (server) {
+          const listed = await tmux(['list-panes', '-s', '-t', receipt.tmux.sessionId, '-F', tmuxFormat]);
+          if (listed.code !== 1) {
+            if (listed.code || listed.stderr) return false;
+            if (listed.stdout.split('\n').some(line => line.split('|')[5] === receipt.tmux.paneId)) return false;
+          }
+        }
+        const current = await this.readReceipt(receipt.id);
+        if (!same(current, receipt)) return false;
+        await writeJSON(join(this.runDir(receipt.id), 'receipt.json'), { ...receipt, closed: true, cleanupReason: 'already_absent' });
+        return true;
+      });
+    },
     async connect(receipt) {
       const path = join(this.runDir(receipt.id), 'control.sock'); await privatePath(path, 'isSocket', 0o600);
       return WorkerConnection.connect(path);
     },
-    async stop(receipt) {
+    async stop(receipt, { idle = false } = {}) {
       validReceipt(receipt);
       if (receipt.codex && (!Number.isSafeInteger(receipt.codex.pid) || receipt.codex.pid < 2 || !/^\d+$/.test(receipt.codex.startTicks || '') || typeof receipt.codex.executable !== 'string' || basename(receipt.codex.executable) !== 'codex' || receipt.codex.ppid !== receipt.worker.pid || !Array.isArray(receipt.codex.commandline) || !same(receipt.codex.commandline.slice(1), ['app-server']))) fail(409, 'runtime_record', '官方 Codex 记录身份无效。');
       const worker = await getProcess(receipt.worker.pid), codex = receipt.codex && await getProcess(receipt.codex.pid);
@@ -254,7 +349,15 @@ export function createRuntimePlatform({ root = ROOT, filesystem = fs, exec = exe
       }
       const currentCodex = receipt.codex && await getProcess(receipt.codex.pid);
       if (currentCodex && (!processMatches(receipt.codex, currentCodex) || currentCodex.ppid !== receipt.worker.pid)) fail(409, 'runtime_identity', '官方 Codex 身份已改变，不会停止。');
-      const result = await tmux(['kill-pane', '-t', receipt.tmux.paneId]);
+      let result;
+      if (idle) {
+        // Evaluate attachment and pane/window ownership on the tmux server's
+        // command queue immediately before mutation, not in an earlier probe.
+        const checks = [['pid', receipt.tmux.serverPid], ['session_id', receipt.tmux.sessionId], ['session_name', receipt.tmux.sessionName], ['window_id', receipt.tmux.windowId], ['pane_id', receipt.tmux.paneId], ['pane_pid', receipt.worker.pid], ['session_attached', 0], ['session_windows', 1], ['window_panes', 1], ['pane_dead', 0]].map(([key, value]) => `#{==:#{${key}},${value}}`);
+        const condition = checks.reduceRight((right, left) => right ? `#{&&:${left},${right}}` : left, '');
+        result = await tmux(['if-shell', '-F', '-t', receipt.tmux.paneId, condition, `kill-pane -t ${receipt.tmux.paneId}`, 'display-message -p runtime_cleanup_blocked']);
+        if (result.stdout?.includes('runtime_cleanup_blocked')) fail(409, 'runtime_changed', '终端连接或窗格状态在停止前改变，不会自动回收。');
+      } else result = await tmux(['kill-pane', '-t', receipt.tmux.paneId]);
       if (result.code || result.stderr) fail(409, 'runtime_stop_failed', '独立运行未确认关闭。');
       for (let n = 0; n < 60; n++) { if (!await getProcess(receipt.worker.pid) && (!receipt.codex || !await getProcess(receipt.codex.pid))) return; await delay(50); }
       fail(409, 'runtime_stop_failed', '运行进程仍然在线，请重新核对。');
@@ -358,9 +461,9 @@ export class WorkerConnection extends EventEmitter {
 }
 
 export class RuntimeRpc extends EventEmitter {
-  constructor(config, { mock = false, root = ROOT, rpcFactory = (config, options) => new RpcClient(config, options), platform = createRuntimePlatform({ root }), connectWorker } = {}) {
+  constructor(config, { mock = false, root = ROOT, clock = Date.now, rpcFactory = (config, options) => new RpcClient(config, options), platform = createRuntimePlatform({ root, clock }), connectWorker } = {}) {
     super(); this.config = config; this.mock = mock; this.platform = platform; this.connectWorker = connectWorker || (receipt => platform.connect(receipt));
-    this.library = rpcFactory(config, { mock, experimentalApi: true }); this.runs = new Map(); this.creating = new Map(); this.ended = false; this.connected = false;
+    this.library = rpcFactory(config, { mock, experimentalApi: true }); this.runs = new Map(); this.threadRuns = new Map(); this.creating = new Map(); this.preferences = new Map(); this.presence = new Map(); this.clock = clock; this.ended = false; this.connected = false;
     this.library.on('closed', () => { this.ended = true; this.connected = false; this.emit('closed'); });
     for (const event of ['notification', 'approval', 'unsupported']) this.library.on(event, message => {
       if (this.mock || event === 'unsupported') this.emit(event, message);
@@ -388,11 +491,15 @@ export class RuntimeRpc extends EventEmitter {
         this.emit('notification', message);
       } else if (event.event === 'unsupported') this.emit('unsupported');
     });
-    connection.on('closed', () => this.emit('runtimeClosed', { id: receipt.id, threadId: receipt.threadId }));
+    connection.on('closed', () => {
+      const superseded = this.threadRuns.get(receipt.threadId) !== run;
+      if (!superseded) this.threadRuns.delete(receipt.threadId);
+      this.emit('runtimeClosed', { id: receipt.id, runtimeId: receipt.id, threadId: receipt.threadId, superseded });
+    });
     try {
       const snapshot = await connection.call('hello', { cursor: run.cursor, replay: Boolean(existing) });
       if (snapshot.runId !== receipt.id || snapshot.workerPid !== receipt.worker.pid || snapshot.workerStartTicks !== receipt.worker.startTicks || snapshot.pid !== receipt.codex.pid || snapshot.threadId !== receipt.threadId) fail(409, 'runtime_identity', 'IPC 身份与运行记录不匹配。');
-      run.snapshot = snapshot; run.cursor = snapshot.cursor; this.runs.set(receipt.id, run); return run;
+      run.snapshot = snapshot; run.cursor = snapshot.cursor; this.runs.set(receipt.id, run); this.threadRuns.set(receipt.threadId, run); return run;
     } catch (error) { connection.close(); throw error; }
   }
   async findThread(threadId) {
@@ -404,7 +511,7 @@ export class RuntimeRpc extends EventEmitter {
   async create(method, params) {
     // Only startup metadata is persisted. Prompt/instruction/history payloads
     // are never copied into the launch or receipt files.
-    if (Object.keys(params).some(key => !['threadId', 'cwd', 'excludeTurns', 'approvalPolicy', 'sandbox'].includes(key))) fail(400, 'invalid_parameters', '运行启动仅接受会话身份、目录与审批设置。');
+    if (Object.keys(params).some(key => !['threadId', 'cwd', 'projectId', 'excludeTurns', 'approvalPolicy', 'sandbox'].includes(key)) || (params.projectId !== undefined && params.projectId !== null && !idOK(params.projectId))) fail(400, 'invalid_parameters', '运行启动仅接受会话身份、项目、目录与审批设置。');
     const key = method === 'thread/resume' ? params.threadId : randomBytes(8).toString('hex');
     if (this.creating.has(key)) return this.creating.get(key);
     const pending = (async () => {
@@ -437,7 +544,7 @@ export class RuntimeRpc extends EventEmitter {
       if (run) return run.connection.call('rpc', { method, params });
       if (method.startsWith('turn/')) fail(409, 'runtime_required', '请先将该会话加入独立运行区。');
     }
-    if (!['initialize', 'account/read', 'thread/read', 'thread/list', 'thread/turns/list', 'thread/items/list', 'thread/archive'].includes(method)) fail(400, 'method_forbidden', '元数据连接不能执行会话写入。');
+    if (!['initialize', 'account/read', 'thread/read', 'thread/list', 'thread/turns/list', 'thread/items/list', 'thread/archive', 'project/list', 'project/read', 'project/create', 'project/update', 'thread/name/set', 'thread/metadata/update', 'thread/section/move', 'threadSection/list'].includes(method)) fail(400, 'method_forbidden', '元数据连接不能执行会话写入。');
     return this.library.call(method, params);
   }
   answer(id, result) {
@@ -457,12 +564,75 @@ export class RuntimeRpc extends EventEmitter {
         const actual = await this.platform.verify(receipt); if (!actual) continue;
         const run = await this.attach(actual), snapshot = await run.connection.call('hello', { cursor: run.cursor, replay: false }); run.snapshot = snapshot;
         const tmux = { sessionId: actual.tmux.sessionId, sessionName: actual.tmux.sessionName, windowIndex: actual.tmux.windowIndex, paneIndex: actual.tmux.paneIndex, paneId: actual.tmux.paneId, target: `${actual.tmux.sessionId}:${actual.tmux.windowIndex}.${actual.tmux.paneIndex}` };
-        rows.push({ id: actual.id, threadId: actual.threadId, cwd: snapshot.cwd, status: snapshot.status, pid: actual.codex.pid, managed: true, tmuxState: 'attached', tmux, revision: hash({ worker: actual.worker, codex: actual.codex, tmux: actual.tmux, revision: snapshot.revision }), activeTurnId: snapshot.activeTurnId, pendingApprovals: (snapshot.approvals || []).map(message => ({ ...message, id: approvalId(actual.id, message.id) })) });
+        let preference;
+        try { preference = await this.getKeepRunning(actual.threadId); } catch { preference = { keepRunning: true, unknown: true }; }
+        const lifecycle = snapshot.lifecycle?.version === 2 && Number.isFinite(snapshot.lifecycle.lastOutputAt) ? clone(snapshot.lifecycle) : { version: null, idleSince: null, terminalSavedAt: null, lastOutputAt: null, reason: 'worker_upgrade_required' };
+        if (preference.unknown) { lifecycle.reason = 'runtime_preference_unknown'; lifecycle.idleSince = null; }
+        let webConnected = true;
+        try { webConnected = (await this.getWebPresence(actual.threadId)).connected; } catch { lifecycle.reason = 'runtime_presence_unknown'; }
+        rows.push({ id: actual.id, threadId: actual.threadId, cwd: snapshot.cwd, status: snapshot.status, pid: actual.codex.pid, managed: true, tmuxState: 'attached', tmux, revision: hash({ worker: actual.worker, codex: actual.codex, tmux: actual.tmux, revision: snapshot.revision }), activeTurnId: snapshot.activeTurnId, keepRunning: preference.keepRunning, webConnected, lifecycle, pendingApprovals: (snapshot.approvals || []).map(message => ({ ...message, id: approvalId(actual.id, message.id) })) });
       } catch { /* A receipt alone is never a live run. */ }
     }
     return rows;
   }
   async getRun(id) { return (await this.listRuns()).find(run => run.id === id) || null; }
+  async getKeepRunning(threadId) {
+    if (!idOK(threadId)) fail(400, 'invalid_thread', '会话 id 无效。');
+    return this.mock ? { threadId, keepRunning: this.preferences.get(threadId) || false } : this.platform.getKeepRunning(threadId);
+  }
+  async setKeepRunning(threadId, keepRunning) {
+    if (!idOK(threadId) || typeof keepRunning !== 'boolean') fail(400, 'invalid_preference', '会话持续运行设置无效。');
+    if (!this.mock) return this.platform.setKeepRunning(threadId, keepRunning);
+    this.preferences.set(threadId, keepRunning); return { threadId, keepRunning };
+  }
+  async getWebPresence(threadId) {
+    if (!idOK(threadId)) fail(400, 'invalid_thread', '会话 id 无效。');
+    if (!this.mock) return this.platform.getWebPresence(threadId);
+    return { threadId, connected: [...this.presence.values()].some(lease => lease.threadId === threadId && lease.expiresAt > this.clock()), leaseMs: WEB_PRESENCE_LEASE_MS };
+  }
+  async setWebPresence(clientId, threadId) {
+    if (!presenceClientOK(clientId) || (threadId !== null && !idOK(threadId))) fail(400, 'invalid_presence', '网页连接标识或会话无效。');
+    if (!this.mock) return this.platform.setWebPresence(clientId, threadId);
+    for (const [id, lease] of this.presence) if (lease.expiresAt <= this.clock()) this.presence.delete(id);
+    if (threadId === null) this.presence.delete(clientId);
+    else { if (!this.presence.has(clientId) && this.presence.size >= 1000) fail(429, 'runtime_presence_limit', '网页连接记录已满，请稍后重试。'); this.presence.set(clientId, { threadId, expiresAt: this.clock() + WEB_PRESENCE_LEASE_MS }); }
+    return { threadId, connected: threadId !== null, leaseMs: WEB_PRESENCE_LEASE_MS };
+  }
+  releaseWebPresence(clientId) { return this.setWebPresence(clientId, null); }
+  async reapRun(id, expectedRevision, { idleMs = 120 * 60 * 1000 } = {}) {
+    if (this.mock) return { stopped: false, reason: 'mock' };
+    const row = await this.getRun(id);
+    if (!row || row.revision !== expectedRevision || row.lifecycle?.version !== 2) fail(409, 'runtime_changed', '运行状态未知或已改变，不会回收。');
+    const receipt = await this.platform.readReceipt(id), run = this.runs.get(id);
+    const owner = { runId: id, worker: { pid: receipt.worker.pid, startTicks: receipt.worker.startTicks } };
+    let prepared = false;
+    try {
+      await this.platform.cleanupAdmitted(row.threadId, owner, async () => {
+        await this.platform.cleanupIdentity(receipt);
+        const preparedState = await run.connection.call('prepareIdleStop', { revision: run.snapshot.revision, idleMs }); prepared = true;
+        // This second inspection happens after the worker seals admission.
+        // Unknown or changed tmux/process state prevents the stop.
+        await this.platform.cleanupIdentity(receipt);
+        await run.connection.call('confirmIdleStop', { revision: preparedState.revision, idleMs });
+        await this.platform.stop(receipt, { idle: true });
+      });
+    } catch (error) {
+      if (prepared) await run.connection.call('cancelIdleStop').catch(() => {});
+      throw error;
+    }
+    run.connection.close(); this.runs.delete(id);
+    return { stopped: true, id, threadId: row.threadId, archived: false, reason: 'idle_timeout' };
+  }
+  async cleanupStaleRuns() {
+    if (this.mock) return [];
+    const results = [];
+    for (const receipt of await this.platform.receipts()) {
+      if (![1, 2].includes(receipt.lifecycle?.version) || receipt.closed) continue;
+      try { if (await this.platform.reconcileAbsent(receipt)) { this.runs.get(receipt.id)?.connection.close(); this.runs.delete(receipt.id); results.push({ id: receipt.id, threadId: receipt.threadId, stopped: true, reason: 'already_absent', archived: false }); } }
+      catch { /* A crashed or changed runtime remains unknown, never a kill target. */ }
+    }
+    return results;
+  }
   async stopRun(id, expectedRevision) {
     const row = await this.getRun(id);
     const revision = typeof expectedRevision === 'object' ? expectedRevision?.revision : expectedRevision;

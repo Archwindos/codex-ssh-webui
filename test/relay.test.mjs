@@ -124,7 +124,7 @@ test('mock process exit clears pending, refuses reconnection and never resends',
   assert.equal((await f.request('/api/threads', { projectId: 'home' })).status, 503); assert.equal(f.relay.rpc.child, child);
 });
 test('production fails closed without verified schema and user-provided secret', () => {
-  const c = { ...config, sshTarget: 'codex-server', remoteCodex: '/home/demo/.local/bin/codex', verifiedProtocol: { version: '0.165.0', verified: false, schemaVerified: false } };
+  const c = { ...config, sshTarget: 'codex-server', remoteCodex: '/opt/codex/bin/codex', verifiedProtocol: { version: '0.165.0', verified: false, schemaVerified: false } };
   assert.throws(() => validateProduction(c, {}), /协议和 schema/);
   c.verifiedProtocol.verified = true; c.verifiedProtocol.schemaVerified = true;
   assert.throws(() => validateProduction(c, { RELAY_VERIFIED_PROTOCOL: '0.165.0' }), /32 字符/);
@@ -180,7 +180,7 @@ test('UTF-8 split across every byte survives protocol decoding; ChatGPT auth fla
     for (const byte of Buffer.from(JSON.stringify({ id: m.id, result }) + '\n')) child.stdout.write(Buffer.from([byte]));
   });
   let spawnArgs;
-  const rpc = new RpcClient({ ...config, sshTarget: 'codex-server', remoteCodex: '/home/demo/.local/bin/codex', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } }, { mock: false, spawnProcess: (...args) => { spawnArgs = args; return child; } });
+  const rpc = new RpcClient({ ...config, sshTarget: 'codex-server', remoteCodex: '/opt/codex/bin/codex', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } }, { mock: false, spawnProcess: (...args) => { spawnArgs = args; return child; } });
   await rpc.start(); assert.equal(rpc.connected, true); assert.equal(spawnArgs[0], 'ssh'); assert.ok(!Object.hasOwn(spawnArgs[2].env, 'RELAY_ACCESS_SECRET')); assert.equal(spawnArgs[2].windowsHide, true);
   if (process.platform === 'win32') assert.equal(spawnArgs[2].env.ProgramData, process.env.ProgramData);
   let received; rpc.on('notification', m => received = m);
@@ -214,7 +214,7 @@ test('server-resolved and stale-turn approvals cannot later be approved', async 
   rpc.emit('approval', { id: 11, method: 'item/commandExecution/requestApproval', params: { ...params, turnId: 'stale-turn' } }); assert.equal(rpc.answerResult.result.decision, 'decline'); assert.equal(f.relay.state.approvals.size, 0);
 });
 
-const productionConfig = { ...config, sshTarget: 'codex-server', remoteCodex: '/home/demo/.local/bin/codex', publicOrigin: 'https://fixture.example.invalid', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
+const productionConfig = { ...config, sshTarget: 'codex-server', remoteCodex: '/opt/codex/bin/codex', publicOrigin: 'https://fixture.example.invalid', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
 const fixtureEnv = { RELAY_ACCESS_SECRET: 'TEST_ONLY_NEVER_FOR_DEPLOYMENT_1234567890', RELAY_VERIFIED_PROTOCOL: '0.165.0' };
 
 test('production validates HTTPS origin and Secure cookie, login limit survives anonymous session replacement', async t => {

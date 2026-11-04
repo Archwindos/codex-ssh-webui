@@ -33,18 +33,21 @@ const writerIdentity = holders => digest(holders.map(p => [p.threadId, p.managed
 
 // Only official metadata and archive RPCs touch the conversation library.
 // The freeze applies to managed admission; manual CLI writers are observed, not locked.
-export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, freezeThreads, releaseFrozenThreads, authoritativeDescendants = false, storeFile = null, filesystem = fs, clock = Date.now } = {}) {
+export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, freezeThreads, releaseFrozenThreads, inspectThreadStates, atomicity = 'managed-admission-only', authoritativeDescendants = false, storeFile = null, filesystem = fs, clock = Date.now } = {}) {
   if (!rpc?.call || ![inspectWriters, stopManagedRuns, freezeThreads].every(fn => typeof fn === 'function')) fail(500, 'archive_configuration', '归档需要完整的写入者核验、运行停止和准入冻结接口。');
   if (storeFile !== null && (typeof storeFile !== 'string' || !isAbsolute(storeFile) || typeof releaseFrozenThreads !== 'function')) fail(500, 'archive_configuration', '持久归档回执需要本机绝对路径和精确解除冻结接口。');
   if (typeof authoritativeDescendants !== 'boolean') fail(500, 'archive_configuration', '权威后代查询设置必须为布尔值。');
+  if ((inspectThreadStates !== undefined && typeof inspectThreadStates !== 'function') || !['managed-admission-only', 'gateway-admission-only'].includes(atomicity) || (atomicity === 'gateway-admission-only' && !inspectThreadStates)) fail(500, 'archive_configuration', '原生归档需要完整的状态核验接口。');
+  const scopeNotice = atomicity === 'gateway-admission-only' ? { atomicity, atomicityMessage: '归档期间会暂停从本网页发送消息。其他 Codex 客户端仍能改变对话或子对话，请先确认它们不会继续操作。' } : { atomicity };
   const plans = new Map(), operations = new Map();
   const statuses = ['complete', 'partial', 'failed', 'unknown'], itemStatuses = ['archived', 'alreadyArchived', 'notArchived', 'unknown'];
-  const receipt = (operation, status = 'unknown', phase = operation.phase || 'recovering') => ({ operationId: operation.id, threadId: operation.threadId, status, phase, affected: operation.affected.map(row => ({ id: row.id, name: row.id, archived: row.archived, status: 'unknown' })), reports: [...operation.reports], archiveAttempted: operation.archiveAttempted, freezeRetained: operation.freezeRetained, atomicity: 'managed-admission-only' });
+  const receipt = (operation, status = 'unknown', phase = operation.phase || 'recovering') => ({ operationId: operation.id, threadId: operation.threadId, status, phase, affected: operation.affected.map(row => ({ id: row.id, name: row.id, archived: row.archived, status: 'unknown' })), reports: [...operation.reports], archiveAttempted: operation.archiveAttempted, freezeRetained: operation.freezeRetained, ...scopeNotice });
   const record = operation => ({
     operationId: operation.id, ownerScope: operation.ownerScope, threadId: operation.threadId,
     createdAt: operation.createdAt, updatedAt: operation.updatedAt, phase: operation.phase || 'recovering',
     status: operation.result?.status || 'unknown', archiveAttempted: operation.archiveAttempted,
     requestUncertain: operation.requestUncertain, freezeRetained: operation.freezeRetained,
+    ...(operation.scopeFingerprint ? { scopeFingerprint: operation.scopeFingerprint } : {}),
     affected: operation.affected.map(row => { const item = operation.result?.affected.find(item => item.id === row.id); return { id: row.id, archived: row.archived, status: item?.status || 'unknown' }; })
   });
   const ready = (async () => {
@@ -55,14 +58,16 @@ export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, fre
       const data = JSON.parse(await filesystem.readFile(storeFile, 'utf8'));
       if (!data || Object.keys(data).sort().join(',') !== 'operations,schemaVersion' || data.schemaVersion !== 1 || !Array.isArray(data.operations) || data.operations.length > limits.plans) throw Error('invalid receipt schema');
       for (const value of data.operations) {
-        if (!value || Object.keys(value).sort().join(',') !== 'affected,archiveAttempted,createdAt,freezeRetained,operationId,ownerScope,phase,requestUncertain,status,threadId,updatedAt' || !validId(value.operationId) || operations.has(value.operationId) || !/^[a-f0-9]{64}$/.test(value.ownerScope) || !validId(value.threadId) || !Number.isFinite(value.createdAt) || !Number.isFinite(value.updatedAt) || typeof value.phase !== 'string' || value.phase.length > 100 || !statuses.includes(value.status) || ['archiveAttempted', 'requestUncertain', 'freezeRetained'].some(key => typeof value[key] !== 'boolean') || !Array.isArray(value.affected) || !value.affected.length || value.affected.length > limits.affected) throw Error('invalid operation');
+        const expectedKeys = ['affected', 'archiveAttempted', 'createdAt', 'freezeRetained', 'operationId', 'ownerScope', 'phase', 'requestUncertain', 'status', 'threadId', 'updatedAt'];
+        if (Object.hasOwn(value || {}, 'scopeFingerprint')) { if (!inspectThreadStates || !/^[a-f0-9]{64}$/.test(value.scopeFingerprint)) throw Error('invalid scope fingerprint'); expectedKeys.push('scopeFingerprint'); }
+        if (!value || Object.keys(value).sort().join(',') !== expectedKeys.sort().join(',') || !validId(value.operationId) || operations.has(value.operationId) || !/^[a-f0-9]{64}$/.test(value.ownerScope) || !validId(value.threadId) || !Number.isFinite(value.createdAt) || !Number.isFinite(value.updatedAt) || typeof value.phase !== 'string' || value.phase.length > 100 || !statuses.includes(value.status) || ['archiveAttempted', 'requestUncertain', 'freezeRetained'].some(key => typeof value[key] !== 'boolean') || !Array.isArray(value.affected) || !value.affected.length || value.affected.length > limits.affected) throw Error('invalid operation');
         const ids = new Set();
         for (const row of value.affected) {
           if (!row || Object.keys(row).sort().join(',') !== 'archived,id,status' || !validId(row.id) || ids.has(row.id) || typeof row.archived !== 'boolean' || !itemStatuses.includes(row.status)) throw Error('invalid confirmed set');
           ids.add(row.id);
         }
         if (!ids.has(value.threadId)) throw Error('missing root');
-        const operation = { id: value.operationId, ownerScope: value.ownerScope, threadId: value.threadId, affected: value.affected.map(row => ({ id: row.id, archived: row.archived })), phase: value.phase, createdAt: value.createdAt, updatedAt: value.updatedAt, archiveAttempted: value.archiveAttempted, requestUncertain: value.requestUncertain, freezeRetained: value.freezeRetained, reports: [{ phase: 'recovery', status: 'loaded', message: '仅恢复已确认集合和回执，不恢复执行或重发请求。' }] };
+        const operation = { id: value.operationId, ownerScope: value.ownerScope, threadId: value.threadId, affected: value.affected.map(row => ({ id: row.id, archived: row.archived })), scopeFingerprint: value.scopeFingerprint, phase: value.phase, createdAt: value.createdAt, updatedAt: value.updatedAt, archiveAttempted: value.archiveAttempted, requestUncertain: value.requestUncertain, freezeRetained: value.freezeRetained, reports: [{ phase: 'recovery', status: 'loaded', message: '仅恢复已确认集合和回执，不恢复执行或重发请求。' }] };
         operation.freeze = { release: () => releaseFrozenThreads([...ids], operation.id) };
         operation.result = { ...receipt(operation, value.status, value.phase), affected: value.affected.map(row => ({ ...row, name: row.id })) };
         operations.set(operation.id, operation);
@@ -96,7 +101,7 @@ export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, fre
       let cursor = null, done = false;
       const seen = new Set();
       for (let page = 0; page < limits.pages; page++) {
-        const response = await rpc.call('thread/list', { archived, limit: 100, cursor, sourceKinds: [...THREAD_SOURCE_KINDS], sortKey: 'created_at', sortDirection: 'asc', ...(ancestorThreadId ? { ancestorThreadId, useStateDbOnly: true } : {}) });
+        const response = await rpc.call('thread/list', { archived, limit: 100, cursor, sourceKinds: [...THREAD_SOURCE_KINDS], sortKey: 'created_at', sortDirection: 'asc', ...(authoritativeDescendants ? { useStateDbOnly: true } : {}), ...(ancestorThreadId ? { ancestorThreadId } : {}) });
         if (!Array.isArray(response?.data) || response.data.length > 100 || (ancestorThreadId && !Object.hasOwn(response, 'nextCursor')) || (response.nextCursor != null && (typeof response.nextCursor !== 'string' || !response.nextCursor || response.nextCursor.length > 4096))) fail(502, 'archive_inventory_incomplete', '对话列表格式或分页信息不完整，不能归档。');
         for (const thread of response.data) {
           const row = metadata(thread, archived);
@@ -207,12 +212,26 @@ export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, fre
     return reasons;
   };
   const visible = row => { const { relationshipUnknown, relationshipConflict, relationshipInvalid, ...result } = row; return result; };
+  const threadStates = async ids => {
+    if (!inspectThreadStates) return { states: [], fingerprint: null, blockedReasons: [] };
+    try {
+      const value = await inspectThreadStates(ids), seen = new Set();
+      if (value?.complete !== true || !Array.isArray(value.states) || value.states.length !== ids.length) throw Error('Incomplete states');
+      const states = value.states.map(row => {
+        if (!ids.includes(row?.threadId) || seen.has(row.threadId) || !['idle', 'notLoaded', 'active', 'systemError', 'unknown'].includes(row.status) || typeof row.fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(row.fingerprint)) throw Error('Invalid native state');
+        seen.add(row.threadId); return { threadId: row.threadId, status: row.status, fingerprint: row.fingerprint };
+      });
+      return { states, fingerprint: digest([...states].sort((a, b) => a.threadId.localeCompare(b.threadId))), blockedReasons: states.filter(row => !['idle', 'notLoaded'].includes(row.status)).map(row => reason(row.status === 'active' ? 'archive_thread_active' : 'archive_state_unknown', row.status === 'active' ? '受影响对话仍在执行、等待审批或等待回答；未停止或回答任何请求。' : '受影响对话的原生状态无法确定，不能归档。', [row.threadId])) };
+    } catch { return { states: [], fingerprint: null, blockedReasons: [reason('archive_state_unknown', '未能完整核对所有受影响对话的原生状态，不能归档。', ids)] }; }
+  };
   const checkFresh = async plan => {
     try {
       const current = await readScope(plan.threadId);
       if (current.blockedReasons.length || identity(current.affected) !== plan.fingerprint) throw Error('changed');
+      const state = await threadStates(current.affected.map(row => row.id));
+      if (state.blockedReasons.length || state.fingerprint !== plan.stateFingerprint) throw Error('state changed');
       return current;
-    } catch { fail(409, 'archive_plan_changed', '归档范围或完整性已改变，请重新预检并确认。'); }
+    } catch { fail(409, 'archive_plan_changed', '归档范围、原生状态或完整性已改变，请重新预检并确认。'); }
   };
   const ownedOperation = (id, owner) => {
     if (!validOwner(owner) || !validId(id)) fail(400, 'invalid_archive_parameters', '归档操作或会话身份无效。');
@@ -236,12 +255,22 @@ export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, fre
     });
     const observation = await writers(operation.affected.map(row => row.id));
     operation.reports.push({ phase: 'writers', status: observation.complete && !observation.holders.length ? 'clear' : 'unknown', holders: observation.holders, complete: observation.complete });
+    const native = await threadStates(operation.affected.map(row => row.id));
+    let nativeScopeClear = true;
+    if (inspectThreadStates) {
+      operation.reports.push({ phase: 'nativeStateVerification', status: native.blockedReasons.length ? 'unknown' : 'clear', blockedReasons: native.blockedReasons });
+      try {
+        const current = await readScope(operation.threadId), normalize = rows => rows.map(row => ({ ...row, archived: false }));
+        nativeScopeClear = !current.blockedReasons.length && identity(normalize(current.affected)) === operation.scopeFingerprint;
+        operation.reports.push({ phase: 'nativeScopeVerification', status: nativeScopeClear ? 'unchanged' : 'changed', unconfirmedThreadIds: current.affected.filter(row => !operation.affected.some(before => before.id === row.id)).map(row => row.id) });
+      } catch (error) { nativeScopeClear = false; operation.reports.push({ phase: 'nativeScopeVerification', status: 'unknown', ...problem(error) }); }
+    }
     const unknown = affected.some(row => row.status === 'unknown'), success = affected.filter(row => ['archived', 'alreadyArchived'].includes(row.status)).length;
     if (success === affected.length && !unknown) operation.requestUncertain = false;
-    const settled = !unknown && !operation.requestUncertain, writersClear = observation.complete && !observation.holders.length;
+    const settled = !unknown && !operation.requestUncertain, writersClear = observation.complete && !observation.holders.length && !native.blockedReasons.length && nativeScopeClear;
     operation.phase = 'verified'; operation.updatedAt = clock();
     const status = !settled || !writersClear || operation.storageFault ? 'unknown' : success === affected.length ? 'complete' : success ? 'partial' : 'failed';
-    operation.result = { operationId: operation.id, threadId: operation.threadId, status, phase: 'verified', affected, reports: [...operation.reports], archiveAttempted: operation.archiveAttempted, freezeRetained: operation.freezeRetained, atomicity: 'managed-admission-only' };
+    operation.result = { operationId: operation.id, threadId: operation.threadId, status, phase: 'verified', affected, reports: [...operation.reports], archiveAttempted: operation.archiveAttempted, freezeRetained: operation.freezeRetained, ...scopeNotice };
     try {
       await persist(); // Durable evidence precedes releasing durable admission markers.
       if (settled && writersClear && !operation.storageFault) await release(operation);
@@ -263,19 +292,20 @@ export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, fre
     try { tree = await readScope(threadId); }
     catch (error) {
       if (error instanceof RelayError && error.code === 'archive_thread_missing') throw error;
-      return { planId: null, threadId, affected: [], requiresConfirmation: true, canArchive: false, blockedReasons: [problem(error)] };
+      return { planId: null, threadId, affected: [], requiresConfirmation: true, canArchive: false, blockedReasons: [problem(error)], ...scopeNotice };
     }
-    const ids = tree.affected.map(row => row.id), observation = await writers(ids);
-    const blockedReasons = [...tree.blockedReasons, ...writerProblems(observation, ids)];
-    const affected = tree.affected.map(row => ({ ...visible(row), writers: observation.holders.filter(holder => holder.threadId === row.id) }));
-    if (blockedReasons.length) return { planId: null, threadId, affected, requiresConfirmation: true, canArchive: false, blockedReasons };
+    const ids = tree.affected.map(row => row.id), observation = await writers(ids), native = await threadStates(ids);
+    const blockedReasons = [...tree.blockedReasons, ...writerProblems(observation, ids), ...native.blockedReasons];
+    const affected = tree.affected.map(row => ({ ...visible(row), writers: observation.holders.filter(holder => holder.threadId === row.id), ...(inspectThreadStates ? { nativeStatus: native.states.find(state => state.threadId === row.id)?.status || 'unknown' } : {}) }));
+    if (blockedReasons.length) return { planId: null, threadId, affected, requiresConfirmation: true, canArchive: false, blockedReasons, ...scopeNotice };
     if (plans.size >= limits.plans) fail(429, 'archive_plan_limit', '待确认归档预检过多，请稍后重试。');
     const planId = token(), expiresAt = clock() + limits.ttl;
-    plans.set(planId, { owner, threadId, affected: tree.affected, fingerprint: identity(tree.affected), writerFingerprint: writerIdentity(observation.holders), expiresAt });
-    return { planId, threadId, affected, requiresConfirmation: true, canArchive: true, expiresAt };
+    plans.set(planId, { owner, threadId, affected: tree.affected, fingerprint: identity(tree.affected), writerFingerprint: writerIdentity(observation.holders), stateFingerprint: native.fingerprint, expiresAt });
+    return { planId, threadId, affected, requiresConfirmation: true, canArchive: true, expiresAt, ...scopeNotice };
   };
-  const execute = async (planId, owner) => {
+  const execute = async (planId, owner, { onOperation } = {}) => {
     await ready;
+    if (onOperation !== undefined && typeof onOperation !== 'function') fail(500, 'archive_configuration', '归档回执关联器无效。');
     if (!validId(planId) || !validOwner(owner)) fail(400, 'invalid_archive_parameters', '归档预检或登录会话身份无效。');
     const plan = plans.get(planId);
     if (!plan || plan.owner !== owner) fail(403, 'archive_plan_forbidden', '归档预检不属于当前登录会话。');
@@ -283,11 +313,12 @@ export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, fre
     if (clock() >= plan.expiresAt) fail(409, 'archive_plan_expired', '归档确认已过期，请重新预检。');
     for (const [id, op] of operations) if (operations.size >= limits.plans && op.result && !op.freezeRetained) operations.delete(id);
     if (operations.size >= limits.plans) fail(429, 'archive_operation_limit', '仍有未完成的归档操作，请先重新核验。');
-    const operation = { id: `archive-${token()}`, ownerScope: digest(owner), threadId: plan.threadId, affected: plan.affected, reports: [], freezeRetained: false, archiveAttempted: false, requestUncertain: false, phase: 'preflight', createdAt: clock(), updatedAt: clock() };
+    const operation = { id: `archive-${token()}`, ownerScope: digest(owner), threadId: plan.threadId, affected: plan.affected, ...(inspectThreadStates ? { scopeFingerprint: identity(plan.affected.map(row => ({ ...row, archived: false }))) } : {}), reports: [], freezeRetained: false, archiveAttempted: false, requestUncertain: false, phase: 'preflight', createdAt: clock(), updatedAt: clock() };
     if (typeof releaseFrozenThreads === 'function') operation.freeze = { release: () => releaseFrozenThreads(operation.affected.map(row => row.id), operation.id) };
     operations.set(operation.id, operation);
     plan.executing = true;
     plan.promise = (async () => {
+      if (onOperation) { operation.phase = 'preflightLinked'; operation.result = receipt(operation, 'unknown', operation.phase); await persist(); await onOperation(operation.id); operation.result = null; }
       await checkFresh(plan);
       const ids = plan.affected.map(row => row.id);
       operation.phase = 'freezePending'; operation.freezeRetained = true;
@@ -338,7 +369,12 @@ export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, fre
       return verify(operation);
     })().catch(async error => {
       if (!operation.freezeRetained) {
-        operations.delete(operation.id);
+        if (onOperation) {
+          operation.phase = operation.archiveAttempted ? 'blocked' : 'preflightRejected';
+          operation.reports.push({ phase: 'blocked', status: operation.archiveAttempted ? 'unknown' : 'notAttempted', ...problem(error) });
+          operation.result = receipt(operation, operation.archiveAttempted ? 'unknown' : 'failed', operation.phase);
+          error.operationId = operation.id; error.archiveAttempted = operation.archiveAttempted;
+        } else operations.delete(operation.id);
         try { await persist(); } catch { /* A retained on-disk receipt can only be rechecked, never replayed. */ }
       }
       else {
@@ -356,6 +392,10 @@ export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, fre
   const recheck = async (operationId, owner) => {
     await ready;
     const operation = ownedOperation(operationId, owner);
+    if (operation.promise && operation.phase === 'preflightLinked') { try { await operation.promise; } catch (error) { if (!operation.result) throw error; } }
+    if (!operation.archiveAttempted && !operation.freezeRetained && ['preflightLinked', 'preflightRejected'].includes(operation.phase)) {
+      operation.phase = 'preflightRejected'; operation.result = receipt(operation, 'failed', operation.phase); await persist(); return operation.result;
+    }
     if (!operation.result) { await operation.promise; if (!operation.result) fail(409, 'archive_not_executed', '该操作未执行归档，请重新预检。'); }
     if (!operation.recheckPromise) { operation.storageFault = false; operation.recheckPromise = verify(operation).finally(() => { operation.recheckPromise = null; }); }
     return operation.recheckPromise;
@@ -366,5 +406,8 @@ export function createArchiveService({ rpc, inspectWriters, stopManagedRuns, fre
     const scope = digest(owner);
     return [...operations.values()].filter(operation => operation.ownerScope === scope && (operation.freezeRetained || !operation.result || operation.result.status === 'unknown')).map(operation => ({ operationId: operation.id, threadId: operation.threadId, status: operation.result?.status || 'unknown', phase: operation.phase, affectedCount: operation.affected.length, freezeRetained: operation.freezeRetained, archiveAttempted: operation.archiveAttempted, createdAt: operation.createdAt, updatedAt: operation.updatedAt }));
   };
-  return { preview, execute, recheck, listOperations, ready };
+  const frozen = threadId => [...operations.values()].some(operation => operation.freezeRetained && operation.affected.some(row => row.id === threadId));
+  const isFrozen = async threadId => { await ready; return frozen(threadId); };
+  const admit = async (threadId, dispatch) => { await ready; if (frozen(threadId)) fail(409, 'thread_frozen', '归档核验尚未结束，暂不能修改此对话。'); return dispatch(); };
+  return { preview, execute, recheck, listOperations, isFrozen, admit, ready };
 }

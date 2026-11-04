@@ -79,6 +79,41 @@ test('killing a runtime leaves the library and original conversation resumable',
   assert.equal(f.rpc.calls.some(([method]) => method === 'thread/archive'), false);
   assert.equal((await f.request('/api/runtimes/join', { threadId: 'old' })).data.thread.id, 'old');
 });
+
+test('current runtime closure clears active execution and approvals, invalidates rows, and permits same-ID continuation', async t => {
+  const f = await fixture(t); await f.request('/api/runtimes/join', { threadId: 'old' });
+  f.rpc.emit('notification', { method: 'turn/started', params: { threadId: 'old', turn: { id: 'active-turn', status: 'inProgress' } } });
+  f.rpc.emit('approval', { id: 'pending-approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'old', turnId: 'active-turn', itemId: 'item', cwd: '/workspace' } });
+  assert.equal((await f.request('/api/runtimes')).data.data.length, 1); assert.equal(f.relay.state.approvals.size, 1);
+  f.rpc.runs = []; f.rpc.emit('runtimeClosed', { runtimeId: 'run-old', threadId: 'old', superseded: false });
+  assert.equal(f.relay.state.loadedThreads.has('old'), false); assert.equal(f.relay.state.activeTurns.has('old'), false); assert.equal(f.relay.state.approvals.size, 0);
+  assert.deepEqual((await f.request('/api/runtimes')).data.data, []);
+  const event = f.relay.state.events.find(event => event.data.status === 'runtime-closed'); assert.equal(event.data.runtimeId, 'run-old'); assert.equal(event.data.threadId, 'old');
+  assert.equal((await f.request('/api/runtimes/join', { threadId: 'old' })).data.thread.id, 'old');
+  assert.equal((await f.request('/api/turns', { projectId: 'home', threadId: 'old', submissionId: 'after-external-close', text: 'continue' })).status, 200);
+});
+
+test('superseded runtime closure preserves the new same-thread turn and its approvals', async t => {
+  const f = await fixture(t); await f.request('/api/runtimes/join', { threadId: 'old' }); await f.request('/api/runtimes');
+  f.rpc.runs = [{ ...f.rpc.runs[0], id: 'replacement-run', runtimeId: 'replacement-run' }];
+  f.rpc.emit('notification', { method: 'turn/started', params: { threadId: 'old', turn: { id: 'replacement-turn', status: 'inProgress' } } });
+  f.rpc.emit('approval', { id: 'replacement-approval', method: 'item/fileChange/requestApproval', params: { threadId: 'old', turnId: 'replacement-turn', itemId: 'item', cwd: '/workspace' } });
+  f.rpc.emit('runtimeClosed', { runtimeId: 'run-old', threadId: 'old', superseded: true });
+  assert.equal(f.relay.state.loadedThreads.has('old'), true); assert.equal(f.relay.state.activeTurns.get('old'), 'replacement-turn'); assert.equal(f.relay.state.approvals.has('replacement-approval'), true);
+  assert.equal((await f.request('/api/runtimes')).data.data[0].runtimeId, 'replacement-run');
+  assert.equal((await f.request('/api/turns', { projectId: 'home', threadId: 'old', submissionId: 'must-stay-busy', text: 'do not overlap' })).data.error.code, 'turn_busy');
+});
+
+test('a disconnected pending turn releases its reservation after rejection so the same thread can send again', async t => {
+  const f = await fixture(t); await f.request('/api/runtimes/join', { threadId: 'old' });
+  const entered = Promise.withResolvers(), response = Promise.withResolvers(), call = f.rpc.call.bind(f.rpc); let held = false;
+  f.rpc.call = async (method, params) => { if (method === 'turn/start' && !held) { held = true; entered.resolve(); return response.promise; } return call(method, params); };
+  const pending = f.request('/api/turns', { projectId: 'home', threadId: 'old', submissionId: 'disconnected-submit', text: 'first' });
+  await entered.promise; f.rpc.runs = []; f.rpc.emit('runtimeClosed', { runtimeId: 'run-old', threadId: 'old', superseded: false });
+  response.reject(new RelayError(503, 'runtime_disconnected', '运行已断开。')); assert.equal((await pending).status, 503);
+  await f.request('/api/runtimes/join', { threadId: 'old' });
+  assert.equal((await f.request('/api/turns', { projectId: 'home', threadId: 'old', submissionId: 'continued-submit', text: 'continue' })).status, 200);
+});
 test('runtime homepage contains actual idle and working rows, not unrelated overview shells', async t => {
   const f = await fixture(t); await f.request('/api/runtimes/join', { threadId: 'old' });
   const overview = await f.request('/api/overview');

@@ -7,7 +7,7 @@ import vm from 'node:vm';
 import { createRelay } from '../src/server.mjs';
 
 const config = { projects: [{ id: 'home', name: 'Home', cwd: '/workspace' }] };
-const productionConfig = { ...config, sshTarget: 'codex-server', remoteCodex: '/home/demo/.local/bin/codex', publicOrigin: 'https://relay.test.example', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
+const productionConfig = { ...config, sshTarget: 'codex-server', remoteCodex: '/opt/codex/bin/codex', publicOrigin: 'https://relay.test.example', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
 const fixtureEnv = { RELAY_ACCESS_SECRET: 'TEST_ONLY_NEVER_FOR_DEPLOYMENT_1234567890', RELAY_VERIFIED_PROTOCOL: '0.165.0' };
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(fn) { for (let n = 0; n < 150; n++) { if (fn()) return; await delay(10); } assert.fail('Timed out waiting for fixture'); }

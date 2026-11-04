@@ -4,6 +4,14 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "engines": { "node": ">=24" },
-  "scripts": { "start": "node src/server.mjs --mock", "test": "node --test test/*.test.mjs" }
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.mjs --mock",
+    "test": "node --test test/*.test.mjs",
+    "test:desktop:windows": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/desktop-client/test-windows.ps1",
+    "test:desktop:macos": "bash scripts/desktop-client/test-macos.sh",
+    "test:desktop:keychain": "node scripts/desktop-client/test-macos-keychain.cjs"
+  }
 }

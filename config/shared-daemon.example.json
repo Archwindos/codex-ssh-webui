@@ -1,0 +1,26 @@
+{
+  "accessMode": "ssh-loopback-http",
+  "eventTransport": "poll",
+  "transport": "local",
+  "remoteCodex": "/opt/codex/bin/codex",
+  "sharedDaemonSocket": "/home/demo/.codex/app-server-control/app-server-control.sock",
+  "projects": [
+    {
+      "id": "workspace",
+      "name": "Workspace",
+      "cwd": "/workspace"
+    }
+  ],
+  "workspace": {
+    "roots": [
+      "/workspace"
+    ],
+    "defaultCwd": "/workspace"
+  },
+  "temporaryTerminal": true,
+  "verifiedProtocol": {
+    "version": "0.165.0",
+    "verified": false,
+    "schemaVerified": false
+  }
+}

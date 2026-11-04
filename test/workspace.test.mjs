@@ -68,14 +68,14 @@ async function fixture(t, config, options = {}) {
 
 test('workspace is an explicit local-only production capability and fixed mode stays restricted', async t => {
   const d = await directories(t);
-  const production = { ...d.config, remoteCodex: '/home/demo/.local/bin/codex', publicOrigin: 'https://relay.test.example', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
+  const production = { ...d.config, remoteCodex: '/opt/codex/bin/codex', publicOrigin: 'https://relay.test.example', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
   assert.doesNotThrow(() => validateConfig(production, false, env));
   for (const transport of [undefined, 'ssh']) assert.throws(() => validateConfig({ ...production, transport, sshTarget: 'codex-server' }, false, env), error => error.code === 'configuration');
   for (const workspace of [null, {}, { roots: [], defaultCwd: d.a }, { roots: [d.root], defaultCwd: 'relative' }, { roots: [d.root], defaultCwd: d.a, command: 'ignored' }]) assert.throws(() => validateConfig({ ...d.config, workspace }, true), error => error.code === 'configuration');
   if (process.platform !== 'win32') assert.doesNotThrow(() => validateConfig({ ...d.config, workspace: { roots: ['/'], defaultCwd: d.a } }, true));
   const f = await fixture(t, { projects: d.config.projects });
   const session = await f.request('/api/session');
-  assert.deepEqual(session.data.capabilities, { workspaceBrowser: false, projectManagement: false, allThreads: false, overview: true });
+  assert.deepEqual(session.data.capabilities, { terminal: false, workspaceBrowser: false, projectManagement: false, allThreads: false, overview: true });
   assert.equal((await f.request('/api/directories')).status, 403);
   assert.equal((await f.request('/api/projects', { cwd: d.a })).status, 403);
   assert.equal((await f.request(`/api/projects?cwd=${encodeURIComponent(d.a)}`)).status, 403);
@@ -137,7 +137,7 @@ test('directory listing caps directory entries and marks its limit honestly', as
 
 test('directory and project APIs require login and CSRF, reject extra parameters, and disclose no roots before login', async t => {
   const d = await directories(t);
-  const config = { ...d.config, remoteCodex: '/home/demo/.local/bin/codex', publicOrigin: 'https://relay.test.example', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
+  const config = { ...d.config, remoteCodex: '/opt/codex/bin/codex', publicOrigin: 'https://relay.test.example', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true } };
   const f = await fixture(t, config, { mock: false, env });
   assert.equal((await f.request('/api/directories')).status, 401);
   const session = await f.request('/api/session');
