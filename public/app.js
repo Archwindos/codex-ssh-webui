@@ -1,3 +1,5 @@
+import { renderMessageMarkdown } from './message-markdown.js';
+
 const $ = (id) => document.getElementById(id);
 let terminalController, terminalLoading, terminalAuthEpoch = 0;
 function updateTerminalAccess() {
@@ -20,6 +22,7 @@ function updateTerminalAccess() {
   }).catch(() => { if (epoch === terminalAuthEpoch) { button.hidden = true; error('临时终端界面未加载，请刷新页面重试。'); } });
 }
 const state = { session: null, projectId: null, threadProjectId: null, thread: null, turnId: null, terminalTurns: new Set(), events: null, eventCursor: null, upstreamStatus: 'idle', transportMode: 'sse', transportEpoch: 0, transportTimer: null, pollAbort: null, eventFailures: 0, hydrating: null, approvals: new Map(), items: new Map(), cursor: null, historyScope: 'all', historyEpoch: 0, historyCursor: null, busy: false, posting: false, connected: false, pending: null, view: 'home', priorView: 'home', directory: null, directoryEpoch: 0, directoryLoading: false, projectEdit: null, projectSaving: false, projectConflict: false, overviewTimer: null, overviewRequest: null, overviewEpoch: 0, overview: null, activityPhase: 'idle', activitySince: null, activityTimer: null, activityMessage: '准备好后，发送你的任务。' };
+const subagents = { parentId: null, agents: [], timer: null, request: null, panel: null, stale: false, hasMore: false, rosterKey: '' };
 Object.assign(state, { libraryThreads: [], recentThreads: [], pinnedThreads: [], archived: false, joining: false, operation: null, archiveFreezes: new Map(), draftCwd: '', libraryProjectId: null, searchTerm: '', threadEdit: null, metadataSaving: false, keepRunningSaving: false, chatActionsOpen: false });
 Object.assign(state, { userInputs: new Map(), userInputForms: new Map() });
 Object.assign(state, { messageEpoch: 0, threadLoadEpoch: 0, loadingOlder: null, historyPagingMode: 'turns', suppressScroll: false, userScrollArmed: false, lastScrollTop: 0 });
@@ -376,9 +379,11 @@ function activity(phase, message, fresh = false) {
   renderActivity();
 }
 function upstream(status) {
+  const wasClosed = state.upstreamStatus === 'closed';
   state.upstreamStatus = status;
   connection(status === 'connected', status === 'closed' ? '连接已断开' : status === 'connected' ? (state.session?.mode === 'mock' ? '演示已连接' : '转发已连接') : '等待连接');
-  if (status === 'closed') { stopSubscription(); stopOverview(); state.busy = false; state.turnId = null; state.approvals.clear(); renderApprovals(); activity('closed', sharedMode() ? '连接已断开。重连后会重新读取对话，消息不会自动重发。' : '连接已关闭；请重启 relay。不会自动重发消息。'); }
+  if (status === 'closed') { stopSubscription(); stopOverview(); pauseSubagents(); subagents.stale = true; renderSubagentRoster(); if (subagents.panel) $('subagent-panel-status').textContent = '连接已断开'; state.busy = false; state.turnId = null; state.approvals.clear(); renderApprovals(); activity('closed', sharedMode() ? '连接已断开。重连后会重新读取对话，消息不会自动重发。' : '连接已关闭；请重启 relay。不会自动重发消息。'); }
+  else if (status === 'connected' && wasClosed) scheduleSubagents(0);
 }
 function controls() {
   const ready = !!state.session?.authenticated && state.connected;
@@ -431,6 +436,7 @@ function setAuthenticated(value) {
 }
 function renderView() {
   const authenticated = !!state.session?.authenticated;
+  syncSubagentContext();
   document.documentElement?.classList?.toggle('shared-daemon', sharedMode());
   $('home-view').hidden = !authenticated || state.view !== 'home';
   $('library-view').hidden = !authenticated || state.view !== 'library';
@@ -1036,7 +1042,7 @@ function deltaField(message) {
   if (message.method === 'item/agentMessage/delta') return { id: p.itemId, type: 'agentMessage', field: 'text', index: null };
   if (message.method === 'item/commandExecution/outputDelta') return { id: p.itemId, type: 'commandExecution', field: 'aggregatedOutput', index: null };
   if (message.method === 'item/plan/delta') return { id: p.itemId, type: 'plan', field: 'text', index: null };
-  if (['item/reasoning/summaryTextDelta', 'item/reasoning/textDelta'].includes(message.method)) return { id: p.itemId, type: 'reasoning', field: message.method.includes('summaryTextDelta') ? 'summary' : 'content', index: Math.min(100, Math.max(0, p.summaryIndex ?? p.contentIndex ?? 0)) };
+  if (message.method === 'item/reasoning/summaryTextDelta') return { id: p.itemId, type: 'reasoning', field: 'summary', index: Math.min(100, Math.max(0, p.summaryIndex ?? 0)) };
   return null;
 }
 function snapshotOverlap(text, delta) {
@@ -1101,7 +1107,10 @@ function refreshLatestMessages() {
 }
 function historyAnchor() {
   const container = $('conversation'), box = container.getBoundingClientRect?.();
-  if (box) for (const entry of state.items.values()) { const bounds = entry.node.getBoundingClientRect?.(); if (bounds?.height > 0 && bounds.bottom > box.top) return { node: entry.node, top: bounds.top }; }
+  if (box) for (const node of $('messages').querySelectorAll(':scope > :not(.activity-group), .activity-group > summary, .activity-group[open] .activity-entry')) {
+    const bounds = node.getBoundingClientRect();
+    if (bounds.height > 0 && bounds.bottom > box.top) return { node, top: bounds.top };
+  }
   return null;
 }
 async function loadOlderMessages() {
@@ -1114,11 +1123,18 @@ async function loadOlderMessages() {
     const page = await api(`/api/history?${sharedMode() || state.session?.capabilities?.library ? '' : `project=${encodeURIComponent(activeProjectId())}&`}thread=${encodeURIComponent(request.threadId)}&cursor=${encodeURIComponent(request.cursor)}`);
     if (request.epoch !== state.messageEpoch || request.threadId !== state.thread?.id || request.cursor !== state.historyCursor) return;
     const beforeHeight = container.scrollHeight, beforeTop = container.scrollTop, anchor = historyAnchor();
-    const existing = [...state.items.entries()], added = document.createDocumentFragment(), ids = [];
+    const existing = new Set(state.items.keys()), added = [];
     state.suppressScroll = true;
-    try { for (const turn of page.turns || []) for (const item of turn.items || []) { if (state.items.has(item.id)) { appendItem(item, turn.id); continue; } appendItem(item, turn.id); const entry = state.items.get(item.id); if (entry) { added.append(entry.node); ids.push(item.id); } } }
+    try {
+      for (const turn of page.turns || []) for (const item of turn.items || []) {
+        const isNew = !state.items.has(item.id);
+        appendItem(item, turn.id, false);
+        if (isNew && state.items.has(item.id)) added.push([item.id, state.items.get(item.id)]);
+      }
+      state.items = new Map([...added, ...[...state.items].filter(([id]) => existing.has(id))]);
+      layoutMessages($('messages'), state.items);
+    }
     finally { state.suppressScroll = false; }
-    $('messages').prepend(added); state.items = new Map([...ids.map(id => [id, state.items.get(id)]), ...existing.map(([id]) => [id, state.items.get(id)])]);
     state.historyCursor = page.nextCursor; $('older-messages').hidden = !page.nextCursor;
     const after = anchor?.node.getBoundingClientRect?.();
     container.scrollTop = anchor && after ? container.scrollTop + after.top - anchor.top : beforeTop + container.scrollHeight - beforeHeight;
@@ -1129,11 +1145,19 @@ async function loadOlderMessages() {
 }
 function acceptTurnItems(turn, existingIds) {
   const firstReply = [...state.items.values()].find(entry => !existingIds.has(entry.item.id));
+  const inputs = [];
   for (const item of turn.items || []) {
     if (state.items.has(item.id)) continue;
-    appendItem(item);
-    if (item.type === 'userMessage' && firstReply) firstReply.node.before?.(state.items.get(item.id)?.node);
+    appendItem(item, turn.id, false);
+    if (item.type === 'userMessage' && firstReply && state.items.has(item.id)) inputs.push([item.id, state.items.get(item.id)]);
   }
+  if (inputs.length) {
+    for (const [id] of inputs) state.items.delete(id);
+    state.items = new Map([...state.items].flatMap(entry => entry[0] === firstReply.item.id ? [...inputs, entry] : [entry]));
+  }
+  const follow = nearBottom();
+  layoutMessages($('messages'), state.items);
+  if (follow) scroll(true);
 }
 const turnKey = (threadId, turnId) => JSON.stringify([threadId, turnId]);
 function rememberTerminalTurn(threadId, turnId) {
@@ -1148,49 +1172,305 @@ function acceptTurnStatus(threadId, turn) {
   else if (state.busy && ['sending', 'idle'].includes(state.activityPhase)) activity('thinking', 'Codex 正在思考');
   else if (!state.busy) activity(turn.status, labels[turn.status] || '消息已发送。');
 }
-function appendItem(item, turnId = null) {
-  if (!item?.id) return;
-  const prior = state.items.get(item.id);
-  item = mergeItem(prior?.item, item);
-  const follow = !state.suppressScroll && nearBottom();
-  const type = item.type;
-  let node, body;
-  if (prior) { node = prior.node; body = prior.body; }
-  else if (type === 'userMessage' || type === 'agentMessage') {
+const activityNames = { read: '读文件', search: '搜索', listFiles: '列目录', command: '执行命令', change: '修改文件', web: '网页检索', tool: '调用工具', reasoning: '思考摘要', plan: '任务计划' };
+const activityIcons = {
+  read: 'M12 6v14m0-14c-3-2-6-2-9-1v13c3-1 6-1 9 1 3-2 6-2 9-1V5c-3-1-6-1-9 1Z',
+  search: 'M15 15l5 5M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z',
+  listFiles: 'M3 6h7l2 2h9v11H3Z', command: 'M4 5h16v14H4Zm4 4 3 3-3 3m6 0h3',
+  change: 'M6 3h9l4 4v14H6Zm4 10h5m-5 4h5', web: 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM3 12h18M12 3c4 4 4 14 0 18-4-4-4-14 0-18Z',
+  tool: 'M4 7h16M4 12h16M4 17h16M8 5v4m8 1v4m-5 1v4',
+  reasoning: 'M4 6h16M4 12h12M4 18h8', plan: 'M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01',
+  agent: 'M12 3v4M5 9h14v11H5ZM9 13h.01M15 13h.01M9 17h6',
+};
+function activityKinds(item) {
+  if (item.type === 'commandExecution') {
+    const kinds = (item.commandActions || []).map(action => ['read', 'search', 'listFiles'].includes(action.type) ? action.type : 'command');
+    return kinds.length ? [...new Set(kinds)] : ['command'];
+  }
+  const kind = ({ fileChange: 'change', webSearch: 'web', mcpToolCall: 'tool', dynamicToolCall: 'tool', collabAgentToolCall: 'tool', reasoning: 'reasoning', plan: 'plan' })[item.type];
+  return kind ? [kind] : [];
+}
+function activityTitle(item, kind) {
+  const action = (item.commandActions || []).find(value => value.type === kind);
+  const basename = value => (value || '').split(/[\\/]/).filter(Boolean).at(-1) || value || '';
+  if (kind === 'read') return `读取 ${action?.name || basename(action?.path) || '文件'}`;
+  if (kind === 'listFiles') return `列出 ${basename(action?.path) || '当前目录'} 中的文件`;
+  if (kind === 'search') return action?.query ? `搜索“${action.query}”` : '搜索文件';
+  if (kind === 'command') return item.command ? `执行 ${item.command}` : '执行命令';
+  if (kind === 'change') return item.changes?.length === 1 ? `修改 ${basename(item.changes[0].path)}` : `修改 ${item.changes?.length || 0} 个文件`;
+  if (kind === 'web' && item.query) return `检索“${item.query}”`;
+  if (kind === 'tool' && item.tool) return `调用 ${[item.server, item.tool].filter(Boolean).join(' / ')}`;
+  return activityNames[kind];
+}
+function syncMessageChildren(parent, desired) {
+  const current = Array.from(parent.children);
+  if (current.length <= desired.length && current.every((node, index) => node === desired[index])) {
+    if (current.length < desired.length) parent.append(...desired.slice(current.length));
+  } else parent.replaceChildren(...desired);
+}
+function updateActivityGroup(group) {
+  const counts = new Map();
+  for (const entry of group.entries) if (!entry.node.hidden) for (const kind of entry.kinds) counts.set(kind, (counts.get(kind) || 0) + 1);
+  group.node.hidden = !counts.size;
+  group.label.textContent = Object.keys(activityNames).filter(kind => counts.has(kind)).map(kind => `${activityNames[kind]}${counts.get(kind) > 1 ? ` ${counts.get(kind)}` : ''}`).join(' · ');
+}
+function layoutMessages(root, items) {
+  const blocks = [], usedGroups = new Set();
+  let entries = [];
+  function finishGroup() {
+    if (!entries.length) return;
+    let group = entries.map(entry => entry.group).find(value => value && !usedGroups.has(value));
+    if (!group) {
+      const node = document.createElement('details'), summary = document.createElement('summary');
+      const label = document.createElement('span'), content = document.createElement('div');
+      node.className = 'activity-group'; content.className = 'activity-entries';
+      summary.append(projectIcon(activityIcons.tool), label); node.append(summary, content);
+      group = { node, label, content };
+    }
+    group.entries = entries;
+    for (const entry of entries) entry.group = group;
+    syncMessageChildren(group.content, entries.map(entry => entry.node));
+    updateActivityGroup(group);
+    usedGroups.add(group); blocks.push(group.node); entries = [];
+  }
+  for (const entry of items.values()) {
+    if (entries.length && (!entry.kinds.length || entry.turnId !== entries[0].turnId)) finishGroup();
+    if (entry.kinds.length) entries.push(entry);
+    else { entry.group = null; blocks.push(entry.node); }
+  }
+  finishGroup();
+  syncMessageChildren(root, blocks);
+}
+function renderMessageEntry(prior, incoming, turnId, inspectAgent) {
+  if (!incoming?.id) return null;
+  const item = mergeItem(prior?.item, incoming), type = item.type;
+  const agentEvent = type === 'subAgentActivity' || type === 'collabAgentToolCall' && item.receiverThreadIds?.length && ['spawnAgent', 'resumeAgent', 'closeAgent', 'interruptAgent'].includes(item.tool);
+  const kinds = agentEvent ? [] : activityKinds(item);
+  const reusable = prior && prior.agentEvent === !!agentEvent && prior.item.type === type;
+  let { node, body, rowLabel, rowStatus, icon } = reusable ? prior : {};
+  if (!node && agentEvent) {
+    node = document.createElement('div'); node.className = 'subagent-events'; body = node;
+  } else if (!node && (type === 'userMessage' || type === 'agentMessage')) {
     node = document.createElement('article'); node.className = `message ${type === 'userMessage' ? 'user' : 'agent'}`;
     const heading = document.createElement('div'); heading.className = 'message-heading';
     const name = document.createElement('span'); name.textContent = type === 'userMessage' ? '你' : 'Codex'; heading.append(name);
-    body = document.createElement('div'); body.className = 'message-body'; node.append(heading, body); $('messages').append(node);
-  } else if (['commandExecution', 'fileChange', 'reasoning', 'plan', 'mcpToolCall', 'webSearch'].includes(type)) {
-    node = document.createElement('details'); node.className = 'message tool';
-    const summary = document.createElement('summary'); summary.textContent = ({ commandExecution: '命令执行', fileChange: '文件改动', reasoning: '思考进度', plan: '任务计划', mcpToolCall: '工具调用', webSearch: '网页检索' })[type];
-    body = document.createElement('pre'); node.append(summary, body); $('messages').append(node);
-  } else return;
+    body = document.createElement('div'); body.className = 'message-body'; node.append(heading, body);
+  } else if (!node && kinds.length) {
+    node = document.createElement('details'); node.className = 'activity-entry';
+    const summary = document.createElement('summary'); rowLabel = document.createElement('span'); rowStatus = document.createElement('span');
+    rowLabel.className = 'activity-entry-label'; rowStatus.className = 'activity-entry-status';
+    icon = projectIcon(activityIcons[kinds[0]]); summary.append(icon, rowLabel, rowStatus);
+    body = document.createElement(type === 'reasoning' || type === 'plan' ? 'div' : 'pre');
+    if (type === 'reasoning' || type === 'plan') body.className = 'message-body';
+    node.append(summary, body);
+  }
+  if (!node) return null;
+  node.dataset.itemId = item.id;
+  const entry = { ...prior, node, body, rowLabel, rowStatus, icon, item, kinds, agentEvent: !!agentEvent, turnId: turnId || prior?.turnId || null };
+  if (agentEvent) { renderAgentEvent(entry, inspectAgent); return entry; }
   let text = '';
   if (type === 'userMessage') text = (item.content || []).map(x => x.text || '').join('\n');
   else if (type === 'agentMessage') text = item.text || prior?.text || '';
   else if (type === 'commandExecution') text = [item.command, item.cwd ? `目录：${item.cwd}` : '', item.aggregatedOutput, item.status ? `状态：${labels[item.status] || item.status}` : ''].filter(Boolean).join('\n');
   else if (type === 'fileChange') text = (item.changes || []).map(x => `${x.path || ''}\n${x.diff || ''}`).join('\n\n');
-  else if (type === 'reasoning') text = [...(item.summary || []), ...(item.content || [])].map(x => typeof x === 'string' ? x : x?.text || '').join('\n');
+  else if (type === 'reasoning') text = (item.summary || []).map(x => typeof x === 'string' ? x : x?.text || '').join('\n');
   else text = item.text || JSON.stringify(item, null, 2);
-  body.textContent = text + (item.truncated ? '\n\n[此条显示已截断，请在服务器查看完整记录。]' : '');
-  let attachmentNode = prior?.attachmentNode;
+  const displayText = text + (item.truncated ? '\n\n[此条显示已截断，请在服务器查看完整记录。]' : '');
+  if (['agentMessage', 'reasoning', 'plan'].includes(type)) renderMessageMarkdown(body, displayText);
+  else if (body.textContent !== displayText) body.textContent = displayText;
+  let attachmentNode = reusable ? prior.attachmentNode : null;
   if (type === 'userMessage' && item.attachments?.length) {
     if (!attachmentNode) { attachmentNode = document.createElement('div'); attachmentNode.className = 'message-attachments'; node.append(attachmentNode); }
     attachmentNode.replaceChildren();
     for (const attachment of item.attachments) { const chip = document.createElement('div'); chip.className = 'sent-attachment'; const name = document.createElement('strong'), detail = document.createElement('small'); name.textContent = attachment.name || '附件'; detail.textContent = bytes(attachment.size); chip.append(name, detail); attachmentNode.append(chip); }
   }
   if (type === 'userMessage') body.hidden = !text.trim();
-  node.dataset.itemId = item.id;
   node.hidden = type === 'reasoning' && !text.trim();
-  state.items.set(item.id, { node, body, text, item, attachmentNode, turnId: turnId || prior?.turnId || null }); $('welcome').hidden = true;
+  if (rowLabel) {
+    const title = activityTitle(item, kinds[0]); rowLabel.textContent = title; rowLabel.setAttribute('title', title);
+    rowStatus.textContent = ['inProgress', 'failed', 'interrupted', 'declined'].includes(item.status) ? labels[item.status] || '已拒绝' : '';
+    rowStatus.dataset.status = item.status || '';
+    icon.querySelector?.('path')?.setAttribute('d', activityIcons[kinds[0]]);
+  }
+  return { ...entry, text, attachmentNode };
+}
+function appendItem(item, turnId = null, layout = true) {
+  const prior = state.items.get(item?.id), wasHidden = prior?.node.hidden;
+  const follow = layout && !state.suppressScroll && nearBottom();
+  const entry = renderMessageEntry(prior, item, turnId, openSubagent);
+  if (!entry) return;
+  state.items.set(item.id, entry);
+  $('welcome').hidden = true;
+  if (layout) {
+    if (!prior || entry.node !== prior.node || entry.turnId !== prior.turnId || !!entry.kinds.length !== !!prior.kinds.length) layoutMessages($('messages'), state.items);
+    else if (entry.group && (entry.kinds.join() !== prior.kinds.join() || wasHidden !== entry.node.hidden)) {
+      entry.group.entries = entry.group.entries.map(value => value.item.id === entry.item.id ? entry : value);
+      updateActivityGroup(entry.group);
+    }
+  }
   if (follow) scroll(true);
+}
+function subagentName(agent) {
+  const pathName = agent.agentPath?.split('/').filter(Boolean).at(-1);
+  if (agent.name) return agent.name;
+  if (pathName && pathName !== 'root') return pathName.replaceAll('_', ' ').replace(/^([a-z])/, first => first.toUpperCase());
+  return agent.nickname || `子代理 ${agent.id.slice(0, 8)}`;
+}
+const agentEventLabels = { started: '开始工作', interacted: '收到协作消息', interrupted: '已中断', completed: '已完成', closed: '已关闭' };
+function renderAgentEvent(entry, inspectAgent) {
+  const { item, node } = entry;
+  const ids = item.type === 'subAgentActivity' ? [item.agentThreadId] : item.receiverThreadIds;
+  const event = item.type === 'subAgentActivity' ? item.kind : ({ spawnAgent: 'started', resumeAgent: 'started', closeAgent: 'closed', interruptAgent: 'interrupted' })[item.tool];
+  const key = JSON.stringify([ids, event, item.status, item.agentPath, item.agentsStates, !!inspectAgent && !!state.session?.capabilities?.subagents]);
+  if (entry.eventKey === key) return;
+  entry.eventKey = key;
+  const rows = [...new Set(ids)].filter(id => /^[A-Za-z0-9_-]{1,160}$/.test(id || '')).map(id => {
+    const actionable = inspectAgent && state.session?.capabilities?.subagents;
+    const row = document.createElement(actionable ? 'button' : 'div');
+    const name = document.createElement('span'), label = document.createElement('span');
+    const known = subagents.agents.find(agent => agent.id === id);
+    const agent = { id, agentPath: item.agentPath, ...known };
+    row.className = 'subagent-event'; name.className = 'subagent-event-name'; label.className = 'subagent-event-label';
+    name.textContent = subagentName(agent);
+    label.textContent = item.status === 'failed' ? '协作失败' : item.status === 'inProgress' ? '正在协作' : agentEventLabels[event] || '子代理活动';
+    row.append(projectIcon(activityIcons.agent), name, label);
+    if (actionable) { row.type = 'button'; row.setAttribute('aria-label', `查看 ${name.textContent} 的进展`); row.addEventListener('click', () => inspectAgent(agent, row)); }
+    return row;
+  });
+  node.hidden = !rows.length;
+  node.replaceChildren(...rows);
+}
+function subagentStatus(agent) {
+  if (subagents.stale) return '状态待更新';
+  if (agent.status?.type === 'active') {
+    if (agent.status.activeFlags?.includes('waitingOnApproval')) return '等待审批';
+    if (agent.status.activeFlags?.includes('waitingOnUserInput')) return '等待输入';
+    return '正在工作';
+  }
+  if (agent.status?.type === 'systemError') return '执行异常';
+  const last = [...state.items.values()].findLast(({ item }) => item.type === 'subAgentActivity' && item.agentThreadId === agent.id && item.kind !== 'interacted' || item.agentsStates?.[agent.id]);
+  const status = last?.item.agentsStates?.[agent.id]?.status || last?.item.kind;
+  const ended = ({ completed: '已完成', interrupted: '已中断', errored: '执行异常', shutdown: '已关闭' })[status];
+  if (ended) return ended;
+  return agent.status?.type === 'idle' ? '空闲' : agent.status?.type === 'notLoaded' ? '已停止' : '状态未知';
+}
+function renderSubagentRoster() {
+  const roster = $('subagent-roster'), list = $('subagent-roster-list');
+  roster.hidden = !subagents.parentId || !subagents.agents.length;
+  const agents = [...subagents.agents].sort((a, b) => Number(b.status?.type === 'active') - Number(a.status?.type === 'active'));
+  const key = JSON.stringify(agents.map(agent => [agent.id, subagentName(agent), subagentStatus(agent)]));
+  $('subagent-roster-label').textContent = subagents.hasMore ? '最近的子代理' : '子代理';
+  if (key === subagents.rosterKey) return;
+  const focused = document.activeElement?.dataset?.subagentId;
+  subagents.rosterKey = key;
+  list.replaceChildren(...agents.map(agent => {
+    const button = document.createElement('button'), name = document.createElement('span'), status = document.createElement('span');
+    button.type = 'button'; button.className = 'subagent-chip'; button.dataset.subagentId = agent.id; button.dataset.status = subagents.stale ? 'unknown' : agent.status?.type || '';
+    name.textContent = subagentName(agent); status.textContent = subagentStatus(agent); status.className = 'subagent-chip-status';
+    button.append(name, status); button.addEventListener('click', () => openSubagent(agent, button)); return button;
+  }));
+  if (focused) Array.from(list.children).find(button => button.dataset.subagentId === focused)?.focus();
+}
+function scheduleSubagents(delay = 5000) {
+  clearTimeout(subagents.timer); subagents.timer = null;
+  if (subagents.parentId && document.visibilityState !== 'hidden' && state.upstreamStatus !== 'closed') subagents.timer = setTimeout(() => void refreshSubagents(), delay);
+}
+function pauseSubagents() {
+  clearTimeout(subagents.timer); subagents.timer = null;
+  subagents.request?.abort(); subagents.request = null;
+  if (subagents.panel) { subagents.panel.request?.abort(); subagents.panel.request = null; $('subagent-older').disabled = false; }
+}
+function syncSubagentContext() {
+  const parentId = state.session?.authenticated && state.session.capabilities?.subagents && state.view === 'chat' ? state.thread?.id || null : null;
+  if (subagents.parentId === parentId) return;
+  pauseSubagents(); closeSubagent(false);
+  Object.assign(subagents, { parentId, agents: [], stale: false, hasMore: false });
+  renderSubagentRoster();
+  if (parentId) scheduleSubagents(0);
+}
+async function refreshSubagents() {
+  const parentId = subagents.parentId;
+  if (!parentId || subagents.request || document.visibilityState === 'hidden') return;
+  const request = new AbortController(); subagents.request = request;
+  try {
+    const result = await api(`/api/subagents?parent=${encodeURIComponent(parentId)}`, undefined, request.signal);
+    if (subagents.request !== request || subagents.parentId !== parentId) return;
+    if (!Array.isArray(result.agents)) throw new Error('子代理列表格式无效');
+    Object.assign(subagents, { agents: result.agents, stale: false, hasMore: !!result.hasMore });
+    const panel = subagents.panel, current = panel && subagents.agents.find(agent => agent.id === panel.id);
+    if (panel && (current?.status?.type === 'active' || panel.agent.status?.type === 'active' || !panel.loaded || $('subagent-panel-status').textContent === '连接已断开')) void loadSubagent();
+  } catch {
+    if (subagents.request === request) subagents.stale = true;
+  } finally {
+    if (subagents.request === request) {
+      subagents.request = null; renderSubagentRoster();
+      if (state.busy || subagents.agents.some(agent => agent.status?.type === 'active') || subagents.panel?.agent.status?.type === 'active') scheduleSubagents();
+    }
+  }
+}
+function openSubagent(agent, opener) {
+  if (!subagents.parentId || !state.session?.capabilities?.subagents) return;
+  closeSubagent(false);
+  subagents.panel = { id: agent.id, agent, opener, items: new Map(), cursor: null, request: null, loaded: false };
+  $('subagent-panel-title').textContent = subagentName(agent);
+  $('subagent-panel-status').textContent = subagentStatus(agent);
+  $('subagent-panel').hidden = false; $('close-subagent').focus();
+  void loadSubagent();
+}
+function closeSubagent(restoreFocus = true) {
+  const panel = subagents.panel;
+  if (!panel) return;
+  panel.request?.abort(); subagents.panel = null;
+  $('subagent-panel').hidden = true; $('subagent-messages').replaceChildren();
+  $('subagent-error').hidden = true; $('subagent-empty').hidden = true; $('subagent-older').hidden = true;
+  if (restoreFocus) (panel.opener?.isConnected ? panel.opener : $('conversation')).focus();
+}
+async function loadSubagent(older = false) {
+  const panel = subagents.panel, parentId = subagents.parentId;
+  if (!panel || panel.request || older && !panel.cursor) return;
+  const request = new AbortController(); panel.request = request;
+  const container = $('subagent-scroll');
+  $('subagent-error').hidden = true;
+  $('subagent-older').disabled = true;
+  if (!panel.loaded) { $('subagent-empty').textContent = '正在读取子代理进展…'; $('subagent-empty').hidden = false; }
+  try {
+    const result = await api(`/api/subagents?parent=${encodeURIComponent(parentId)}&thread=${encodeURIComponent(panel.id)}${older ? `&cursor=${encodeURIComponent(panel.cursor)}` : ''}`, undefined, request.signal);
+    if (subagents.panel !== panel || panel.request !== request) return;
+    if (result.agent?.id !== panel.id || !Array.isArray(result.turns)) throw new Error('子代理记录格式无效');
+    const incoming = result.turns.flatMap(turn => (turn.items || []).map(item => ({ item, turnId: turn.id })));
+    const previous = [...panel.items.values()];
+    const overlap = incoming.some(value => panel.items.has(value.item.id));
+    const ordered = older ? mergeMessageOrder(incoming, previous) : overlap ? mergeMessageOrder(previous, incoming) : incoming;
+    const follow = !panel.loaded || container.scrollHeight - container.scrollTop - container.clientHeight < 72;
+    const beforeHeight = container.scrollHeight, beforeTop = container.scrollTop;
+    const items = new Map();
+    for (const value of ordered) {
+      const entry = renderMessageEntry(panel.items.get(value.item.id), value.item, value.turnId);
+      if (entry) items.set(entry.item.id, entry);
+    }
+    panel.items = items; panel.agent = result.agent; panel.loaded = true;
+    if (older || !overlap) panel.cursor = result.nextCursor;
+    layoutMessages($('subagent-messages'), items);
+    $('subagent-panel-title').textContent = subagentName(panel.agent);
+    $('subagent-panel-status').textContent = [subagentStatus(panel.agent), panel.agent.model, effortNames[panel.agent.reasoningEffort] || panel.agent.reasoningEffort].filter(Boolean).join(' · ');
+    $('subagent-empty').textContent = '这位子代理还没有可显示的记录。';
+    $('subagent-empty').hidden = [...items.values()].some(entry => !entry.node.hidden);
+    $('subagent-older').hidden = !panel.cursor;
+    if (older) container.scrollTop = beforeTop + container.scrollHeight - beforeHeight;
+    else if (follow) container.scrollTop = container.scrollHeight;
+    if (panel.agent.status?.type === 'active' && !subagents.timer && !subagents.request) scheduleSubagents();
+  } catch {
+    if (subagents.panel === panel && panel.request === request) { $('subagent-error').hidden = false; $('subagent-empty').hidden = true; }
+  } finally {
+    if (subagents.panel === panel && panel.request === request) { panel.request = null; $('subagent-older').disabled = false; }
+  }
 }
 function renderThread(thread, historyCursor = null, activate = true, projectId = null, options = {}) {
   const targetChanged = state.thread?.id !== thread.id;
   if (targetChanged && !options.composerTransfer) clearDraftAttachments();
   if (targetChanged) state.composerContextError = '';
   const previous = options.preserve && state.thread?.id === thread.id ? [...state.items.values()] : [];
+  const previousItems = new Map(previous.map(entry => [entry.item.id, entry]));
   const beforeTop = $('conversation').scrollTop, following = nearBottom();
   state.threadProjectId = catalogMode() ? thread.projectId ?? null : projectId || thread.projectId || state.session?.projects?.find(p => p.cwd === thread.cwd)?.id || (state.session?.capabilities?.library ? null : state.threadProjectId || state.projectId);
   state.thread = thread; state.turnId = sharedMode() ? thread.activeTurnId || null : null; state.busy = !!state.turnId || ['active', 'inProgress', 'working', 'waitingApproval'].includes(statusType(thread.status)) || thread.runtimes?.some(runtime => runtime.status === 'working') || false; clearMessages();
@@ -1201,7 +1481,11 @@ function renderThread(thread, historyCursor = null, activate = true, projectId =
   const incoming = [];
   for (const turn of thread.turns || []) { for (const item of turn.items || []) incoming.push({ item, turnId: turn.id }); if (turn.status === 'inProgress' && !state.terminalTurns.has(turnKey(thread.id, turn.id))) { state.turnId = turn.id; state.busy = true; } }
   state.suppressScroll = true;
-  for (const entry of previous.length ? mergeMessageOrder(previous, incoming) : incoming) appendItem(entry.item, entry.turnId);
+  for (const value of previous.length ? mergeMessageOrder(previous, incoming) : incoming) {
+    const entry = renderMessageEntry(previousItems.get(value.item.id), value.item, value.turnId, openSubagent);
+    if (entry) state.items.set(entry.item.id, entry);
+  }
+  layoutMessages($('messages'), state.items);
   state.suppressScroll = false;
   $('welcome').hidden = state.items.size > 0;
   activity(state.busy ? 'thinking' : 'idle', state.busy ? 'Codex 正在思考' : '会话已就绪。');
@@ -1445,13 +1729,14 @@ function rpc({ method, params: p = {} }) {
     if (method === 'turn/completed') for (const [id, request] of state.userInputs) if (request.params?.threadId === p.threadId && request.params?.turnId === p.turn?.id) clearUserInput(id);
   }
   if (p.threadId && p.threadId !== state.thread?.id) return;
+  if (method === 'turn/started' || method === 'turn/completed' || ['subAgentActivity', 'collabAgentToolCall'].includes(p.item?.type)) scheduleSubagents(250);
   if (method === 'thread/tokenUsage/updated' && state.thread) { state.thread = { ...state.thread, tokenUsage: p.tokenUsage, context: null }; renderComposer(); }
   if (method === 'turn/started') { state.busy = true; state.turnId = p.turn.id; activity('thinking', 'Codex 正在思考'); void refreshComposerContext(state.thread?.id, { force: true }); }
   if (method === 'item/started' || method === 'item/completed') { appendItem(p.item, p.turnId); if (state.busy && method === 'item/started') activity(p.item?.type === 'reasoning' ? 'thinking' : p.item?.type === 'agentMessage' ? 'responding' : 'tool', p.item?.type === 'reasoning' ? 'Codex 正在思考' : p.item?.type === 'agentMessage' ? 'Codex 正在回复' : ({ commandExecution: '正在执行命令', fileChange: '正在修改文件', webSearch: '正在检索网页', mcpToolCall: '正在调用工具' })[p.item?.type] || 'Codex 正在执行'); }
-  if (method === 'item/agentMessage/delta') { const old = state.items.get(p.itemId); appendItem({ id: p.itemId, type: 'agentMessage', text: (old?.text || '') + p.delta }); if (state.busy) activity('responding', 'Codex 正在回复'); }
-  if (['item/reasoning/summaryTextDelta', 'item/reasoning/textDelta'].includes(method)) { const old = state.items.get(p.itemId); const key = method.includes('summaryTextDelta') ? 'summary' : 'content'; const segments = [...(old?.item?.[key] || [])]; const index = Math.min(100, Math.max(0, p.summaryIndex ?? p.contentIndex ?? 0)); segments[index] = (typeof segments[index] === 'string' ? segments[index] : segments[index]?.text || '') + (p.delta || ''); appendItem({ ...old?.item, id: p.itemId, type: 'reasoning', [key]: segments }); if (state.busy) activity('thinking', 'Codex 正在思考'); }
-  if (method === 'item/plan/delta') { const old = state.items.get(p.itemId); appendItem({ ...old?.item, id: p.itemId, type: 'plan', text: (old?.text || '') + (p.delta || '') }); }
-  if (method === 'turn/plan/updated') appendItem({ id: `plan-${p.turnId}`, type: 'plan', text: [p.explanation, ...(p.plan || []).map(step => `${({ pending: '待执行', inProgress: '进行中', completed: '已完成' })[step.status] || '待执行'} · ${step.step}`)].filter(Boolean).join('\n') });
+  if (method === 'item/agentMessage/delta') { const old = state.items.get(p.itemId); appendItem({ id: p.itemId, type: 'agentMessage', text: (old?.text || '') + p.delta }, p.turnId); if (state.busy) activity('responding', 'Codex 正在回复'); }
+  if (method === 'item/reasoning/summaryTextDelta') { const old = state.items.get(p.itemId), segments = [...(old?.item?.summary || [])]; const index = Math.min(100, Math.max(0, p.summaryIndex ?? 0)); segments[index] = (typeof segments[index] === 'string' ? segments[index] : segments[index]?.text || '') + (p.delta || ''); appendItem({ ...old?.item, id: p.itemId, type: 'reasoning', summary: segments }, p.turnId); if (state.busy) activity('thinking', 'Codex 正在思考'); }
+  if (method === 'item/plan/delta') { const old = state.items.get(p.itemId); appendItem({ ...old?.item, id: p.itemId, type: 'plan', text: (old?.text || '') + (p.delta || '') }, p.turnId); }
+  if (method === 'turn/plan/updated') appendItem({ id: `plan-${p.turnId}`, type: 'plan', text: [p.explanation, ...(p.plan || []).map(step => `${({ pending: '待执行', inProgress: '进行中', completed: '已完成' })[step.status] || '待执行'} · ${step.step}`)].filter(Boolean).join('\n') }, p.turnId);
   if (method === 'item/commandExecution/outputDelta') { const old = state.items.get(p.itemId); if (old) appendItem({ ...old.item, aggregatedOutput: (old.item.aggregatedOutput || '') + p.delta }); }
   if (method === 'turn/completed') { for (const item of p.turn.items || []) appendItem(item, p.turn.id); rememberTerminalTurn(p.threadId || state.thread?.id, p.turn.id); state.busy = false; state.turnId = null; activity(p.turn.status || 'completed', labels[p.turn.status] || '任务已结束。'); for (const [id, a] of state.approvals) if (a.params.turnId === p.turn.id) state.approvals.delete(id); renderApprovals(); run(() => history()); if (sharedMode() && !state.replayingSnapshot && !state.hydrating && (!(p.turn.items || []).length || p.turn.itemsView === 'notLoaded')) run(refreshLatestMessages); }
   if (method === 'thread/status/changed' && p.status) { const status = statusType(p.status); if (status === 'active' && !state.busy) { state.busy = true; activity('thinking', 'Codex 正在工作'); } else if (['idle', 'notLoaded', 'systemError'].includes(status) && state.busy && !state.posting) { state.busy = false; state.turnId = null; activity(status === 'systemError' ? 'failed' : 'idle', status === 'systemError' ? '执行状态异常，请查看当前会话。' : '会话已就绪。'); } }
@@ -1726,14 +2011,19 @@ $('device-retry').addEventListener('click', () => run(async () => { state.device
 $('logout').addEventListener('click', () => run(async () => { await releaseRuntimePresence(); stopSubscription(); if (state.session?.capabilities?.deviceAuthentication) state.deviceSuppressed = true; await api('/api/logout', {}); state.thread = null; state.threadProjectId = null; state.pending = null; savedSelection = null; rememberSelection(); state.approvals.clear(); clearMessages(); await hydrate(); }));
 for (const button of $('examples').querySelectorAll('button')) button.addEventListener('click', () => { $('prompt').value = button.dataset.prompt; controls(); $('prompt').focus(); });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') { void syncRuntimePresence(); stopSubscription(); stopOverview(); stopProjectRefresh(); closeProjectMenu(); }
+  if (document.visibilityState === 'hidden') { void syncRuntimePresence(); stopSubscription(); stopOverview(); stopProjectRefresh(); closeProjectMenu(); pauseSubagents(); }
   else if (state.session?.authenticated) {
     if (state.posting) { subscribe(); void syncRuntimePresence({ force: true }); }
     else run(() => hydrate(true));
     if (state.view === 'home') startOverview();
+    scheduleSubagents(0);
   }
 });
-window.addEventListener('pagehide', () => { runtimePresence.pageLeaving = true; void syncRuntimePresence(); stopSubscription(); stopOverview(); stopProjectRefresh(); });
-window.addEventListener('pageshow', () => { runtimePresence.pageLeaving = false; void syncRuntimePresence({ force: true }); });
+window.addEventListener('pagehide', () => { runtimePresence.pageLeaving = true; void syncRuntimePresence(); stopSubscription(); stopOverview(); stopProjectRefresh(); pauseSubagents(); });
+window.addEventListener('pageshow', () => { runtimePresence.pageLeaving = false; void syncRuntimePresence({ force: true }); scheduleSubagents(0); });
+$('close-subagent').addEventListener('click', () => closeSubagent());
+$('retry-subagent').addEventListener('click', () => void loadSubagent());
+$('subagent-older').addEventListener('click', () => void loadSubagent(true));
+$('subagent-panel').addEventListener('keydown', event => { if (event.key === 'Escape') { event.stopPropagation(); closeSubagent(); } });
 if (window.visualViewport) { const updateViewport = () => { const height = Math.round(window.visualViewport.height); document.documentElement.style.setProperty('--viewport-height', `${height}px`); document.querySelector('.workspace').classList.toggle('keyboard-open', window.innerHeight - height > 150); }; window.visualViewport.addEventListener('resize', updateViewport); updateViewport(); }
 run(() => hydrate());

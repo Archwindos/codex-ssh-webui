@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
+import { appFixtureSource } from './ui-source-fixture.mjs';
 
-const source = (await readFile(new URL('../public/app.js', import.meta.url), 'utf8')).replace(/run\(\(\) => hydrate\(\)\);\s*$/, '');
+const source = appFixtureSource(await readFile(new URL('../public/app.js', import.meta.url), 'utf8'));
 const html = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
 const response = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -179,7 +180,7 @@ test('upward user scrolling loads one page, preserves offset and never recursive
   f.event('conversation', 'scroll'); assert.equal(f.requests.length, 0, 'programmatic scrolling does not fetch');
   f.run('state.lastScrollTop = 200'); container.listeners.get('wheel')({ deltaY: -50 }); f.event('conversation', 'scroll'); f.event('conversation', 'scroll');
   assert.equal(f.requests.length, 1);
-  const prepend = f.nodes.get('messages').prepend; f.nodes.get('messages').prepend = function (...values) { prepend.apply(this, values); container.scrollHeight = 1000; };
+  const replace = f.nodes.get('messages').replaceChildren; f.nodes.get('messages').replaceChildren = function (...values) { replace.apply(this, values); container.scrollHeight = 1000; };
   resolvePage(response({ turns: [{ id: 'old-turn', items: [{ id: 'old', type: 'agentMessage', text: 'old' }] }], nextCursor: 'another' })); await flush();
   assert.equal(container.scrollTop, 500); assert.equal(f.requests.length, 1);
   f.event('conversation', 'scroll'); assert.equal(f.requests.length, 1);
@@ -191,6 +192,23 @@ test('late older-history responses cannot add messages or cursors to a different
   f.run("renderThread({ id: 'b', turns: [{ id: 'b-turn', items: [{ id: 'b-message', type: 'agentMessage', text: 'B' }] }] })");
   resolvePage(response({ turns: [{ id: 'a-turn', items: [{ id: 'a-message', type: 'agentMessage', text: 'A' }] }], nextCursor: 'a-next' })); await loading;
   assert.equal(f.run('state.thread.id'), 'b'); assert.equal(f.run("state.items.has('a-message')"), false); assert.equal(f.run('state.historyCursor'), null);
+});
+
+test('activity groups preserve message boundaries and keep expanded state when an older page joins a group', async t => {
+  const f = fixture(t, () => response({ turns: [{ id: 'turn', items: [{ id: 'older-read', type: 'commandExecution', command: 'cat notes.md', commandActions: [{ type: 'read', name: 'notes.md' }] }] }], nextCursor: null }));
+  f.run(`renderThread({ id: 'same', turns: [{ id: 'turn', items: [
+    { id: 'first', type: 'commandExecution', command: 'run checks' },
+    { id: 'summary', type: 'reasoning', summary: ['Reviewing checks'] },
+    { id: 'agent-event', type: 'subAgentActivity', kind: 'started', agentThreadId: 'child', agentPath: '/root/independent_review' },
+    { id: 'second', type: 'commandExecution', command: 'verify results' },
+    { id: 'answer', type: 'agentMessage', text: 'Result' },
+  ] }] }, 'older'); state.items.get('first').group.node.open = true;`);
+  assert.deepEqual(f.nodes.get('messages').children.map(node => node.className), ['activity-group', 'subagent-events', 'activity-group', 'message agent']);
+  await f.run('loadOlderMessages()');
+  assert.equal(f.run("state.items.get('older-read').group === state.items.get('first').group"), true);
+  assert.equal(f.run("state.items.get('first').group.node.open"), true);
+  assert.match(textOf(f.nodes.get('messages')), /读文件.*执行命令.*思考摘要/);
+  assert.match(textOf(f.nodes.get('messages')), /Independent review.*开始工作/);
 });
 
 test('snapshot recovery retains older messages before new replies and does not shorten live content', async t => {
@@ -236,12 +254,12 @@ test('empty reasoning items keep ordering identity without displaying hundreds o
 });
 
 test('catalog ID merges remove repeated IDs while same-title threads remain and internal visibility resets paging', async t => {
-  const f = fixture(t, ({ url }) => response(url.includes('pinned=true') ? { data: [{ id: 'pin', name: 'ExampleLab', pinned: true, projectId: 'project' }] } : { data: [{ id: 'one', name: 'ExampleLab' }, { id: 'one', name: 'ExampleLab' }, { id: 'two', name: 'ExampleLab' }], nextCursor: 'more' }));
+  const f = fixture(t, ({ url }) => response(url.includes('pinned=true') ? { data: [{ id: 'pin', name: 'Sample project', pinned: true, projectId: 'project' }] } : { data: [{ id: 'one', name: 'Sample project' }, { id: 'one', name: 'Sample project' }, { id: 'two', name: 'Sample project' }], nextCursor: 'more' }));
   f.run("state.session.capabilities.internalThreads = true; state.session.projects = [{ id: 'project', name: 'Project' }]; renderView()");
   await f.run('history()'); await f.run('history(true)');
   assert.deepEqual(Array.from(f.run('state.libraryThreads.map(thread => thread.id)')), ['one', 'two']);
-  f.run("state.recentThreads.push({ id: 'pin', name: 'ExampleLab', projectId: 'project', pinned: true }); renderSidebar()");
-  assert.doesNotMatch(textOf(f.nodes.get('sidebar-projects')), /ExampleLab/);
+  f.run("state.recentThreads.push({ id: 'pin', name: 'Sample project', projectId: 'project', pinned: true }); renderSidebar()");
+  assert.doesNotMatch(textOf(f.nodes.get('sidebar-projects')), /Sample project/);
   f.nodes.get('include-internal').checked = true; f.event('include-internal', 'change'); await flush();
   const internal = f.requests.filter(request => request.url.includes('includeInternal=true'));
   assert.ok(internal.length >= 2); assert.ok(internal.every(request => !request.url.includes('cursor=')));

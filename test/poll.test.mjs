@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
+import { appFixtureSource } from './ui-source-fixture.mjs';
 import { createRelay } from '../src/server.mjs';
 
 const config = { projects: [{ id: 'home', name: 'Home', cwd: '/workspace' }] };
@@ -161,7 +162,7 @@ async function browserFixture(t, fetcher = async () => { throw new Error('Unexpe
   }
   const document = { visibilityState: 'visible', getElementById(id) { if (!nodes.has(id)) nodes.set(id, node()); return nodes.get(id); }, createElement: node, createDocumentFragment: node, addEventListener(name, fn) { listeners.set(name, fn); } };
   const context = vm.createContext({ document, window: { addEventListener(name, fn) { listeners.set(name, fn); } }, sessionStorage: { getItem() { return null; }, setItem() {} }, EventSource: EventSourceFixture, AbortController, fetch: fetcher, setTimeout(fn, ms) { timers.set(++timerId, { fn, ms }); return timerId; }, clearTimeout(id) { timers.delete(id); }, crypto: { randomUUID() { return 'fixture-id'; } } });
-  const source = (await readFile(new URL('../public/app.js', import.meta.url), 'utf8')).replace(/run\(\(\) => hydrate\(\)\);\s*$/, ''); vm.runInContext(source, context);
+  const source = appFixtureSource(await readFile(new URL('../public/app.js', import.meta.url), 'utf8')); vm.runInContext(source, context);
   vm.runInContext("state.session = { authenticated: true, mode: 'mock', csrf: 'TEST_ONLY', connected: true, upstreamStatus: 'connected' }; state.eventCursor = 0; state.upstreamStatus = 'connected';", context);
   t.after(() => vm.runInContext('stopSubscription()', context));
   return { context, sources, timers, nodes, listeners, document, run: code => vm.runInContext(code, context) };

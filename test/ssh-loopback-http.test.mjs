@@ -7,6 +7,7 @@ import { webcrypto, randomBytes, createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
+import { appFixtureSource } from './ui-source-fixture.mjs';
 import { createRelay, validateConfig } from '../src/server.mjs';
 
 const config = { accessMode: 'ssh-loopback-http', transport: 'local', remoteCodex: '/opt/codex/bin/codex', verifiedProtocol: { version: '0.165.0', verified: true, schemaVerified: true }, projects: [{ id: 'acceptance', name: 'Acceptance', cwd: '/isolated/acceptance' }] };
@@ -233,7 +234,7 @@ async function browserFixture(t, fetcher, storage = new Map(), crypto = webcrypt
   const node = () => ({ hidden: false, disabled: false, value: '', textContent: '', children: [], dataset: {}, classList: { toggle() {}, contains() { return false; } }, addEventListener() {}, toggleAttribute() {}, setAttribute() {}, focus() {}, querySelectorAll() { return []; }, append(...values) { this.children.push(...values); }, replaceChildren(...values) { this.children = values; } });
   const document = { visibilityState: 'visible', getElementById(id) { if (!nodes.has(id)) nodes.set(id, node()); return nodes.get(id); }, createElement: node, createDocumentFragment: node, addEventListener() {} };
   const context = vm.createContext({ document, window: { addEventListener() {} }, location: { origin: localOrigin, port: '59119' }, sessionStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) }, EventSource: class { constructor(url) { sources.push(url); } }, AbortController, fetch: fetcher, setTimeout(fn, ms) { timers.set(++timerId, { fn, ms }); return timerId; }, clearTimeout(id) { timers.delete(id); }, crypto, Uint8Array });
-  vm.runInContext((await readFile(new URL('../public/app.js', import.meta.url), 'utf8')).replace(/run\(\(\) => hydrate\(\)\);\s*$/, ''), context);
+  vm.runInContext(appFixtureSource(await readFile(new URL('../public/app.js', import.meta.url), 'utf8')), context);
   t.after(() => vm.runInContext('stopSubscription()', context));
   return { storage, sources, run: code => vm.runInContext(code, context) };
 }

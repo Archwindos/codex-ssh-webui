@@ -430,7 +430,7 @@ export async function createRelay({ mock = true, config = { projects: [{ id: 'ho
     const metadata = catalog && archived !== null ? await catalog.readThread(threadId) : {};
     return { ...result.thread, ...metadata, archived: archived === true, unpersisted: archived === null };
   };
-  const historyPage = async (threadId, cursor) => {
+  const historyPage = async (threadId, cursor, pageSize = 200) => {
     if (sharedMode) {
       const summaries = await rpc.call('thread/turns/list', { threadId, limit: 20, cursor: null, itemsView: 'summary', sortDirection: 'desc' });
       if (!Array.isArray(summaries?.data) || summaries.data.length > 20 || summaries.data.some(turn => !identifier(turn?.id) || typeof turn.status !== 'string' || !turn.status || turn.status.length > 80)) fail(502, 'protocol_mismatch', '历史任务摘要格式无效。');
@@ -439,12 +439,12 @@ export async function createRelay({ mock = true, config = { projects: [{ id: 'ho
       // limit is requested. Fill one web page without scanning the whole turn.
       const entries = [], cursorChain = new Set(cursor ? [cursor] : []); let nativeCursor = cursor || null;
       for (let page = 0; page < 4; page++) {
-        const limit = 200 - entries.length;
+        const limit = pageSize - entries.length;
         const result = await rpc.call('thread/items/list', { threadId, limit, cursor: nativeCursor, sortDirection: 'desc' });
         if (!Array.isArray(result?.data) || result.data.length > limit || (result.nextCursor != null && (typeof result.nextCursor !== 'string' || !result.nextCursor || result.nextCursor.length > 4096 || /[\u0000-\u001f\u007f]/.test(result.nextCursor) || cursorChain.has(result.nextCursor)))) fail(502, 'protocol_mismatch', '历史项目分页格式无效。');
         entries.push(...result.data); nativeCursor = result.nextCursor || null;
         if (nativeCursor) cursorChain.add(nativeCursor);
-        if (!nativeCursor || entries.length === 200) break;
+        if (!nativeCursor || entries.length === pageSize) break;
         if (page === 3) fail(502, 'history_pagination_incomplete', '历史项目分页未能在读取上限内完成，未返回不完整页面。');
       }
       const turns = new Map(), seen = new Set(); let bytes = 0;
@@ -474,6 +474,13 @@ export async function createRelay({ mock = true, config = { projects: [{ id: 'ho
     return { turns, nextCursor: result.nextCursor || null };
   };
   const historyCursor = (projectId, threadId, remoteCursor) => { if (!remoteCursor) return null; const value = token(); cursors.set(value, { kind: sharedMode ? 'history-items' : 'history', projectId, threadId, remoteCursor }); if (cursors.size > 300) cursors.delete(cursors.keys().next().value); return value; };
+  const subagentMetadata = async (thread, parentId) => {
+    const spawn = thread?.source?.subAgent?.thread_spawn;
+    const recordedParents = [thread?.parentThreadId, spawn?.parent_thread_id].filter(value => value != null);
+    if (!identifier(thread?.id) || thread.id === parentId || !recordedParents.length || recordedParents.some(id => id !== parentId)) return null;
+    try { await canonicalProject(thread.cwd); } catch { return null; }
+    return { id: thread.id, name: short(thread.name, 200), agentPath: short(spawn?.agent_path, 500), nickname: short(thread.agentNickname || spawn?.agent_nickname, 100), status: safeThreadStatus(thread.status), model: short(thread.model, 100), reasoningEffort: short(thread.reasoningEffort, 40) };
+  };
   const catalogProjects = async () => {
     await ensureConnected({ reconnect: sharedMode });
     const data = [], seen = new Set(); let cursor;
@@ -485,7 +492,7 @@ export async function createRelay({ mock = true, config = { projects: [{ id: 'ho
     }
     fail(502, 'project_list_incomplete', '项目列表未能完整读取，请重试。');
   };
-  const snapshot = async (session, sid) => { const listedProjects = session.authenticated ? catalog ? await catalogProjects() : [...projects.values()] : []; return ({ mode: mock ? 'mock' : 'production', authenticated: session.authenticated, csrf: session.csrf, ...(loopbackHttp ? { authTransport: 'bearer', ...(sid ? { sessionToken: sid } : {}) } : {}), connected: upstreamStatus() === 'connected', upstreamStatus: upstreamStatus(), eventTransport: loopbackHttp ? 'poll' : config.eventTransport || 'sse', eventCursor: session.authenticated ? nextEvent : 0, projects: listedProjects, capabilities: { terminal: session.authenticated && terminals.capability(), workspaceBrowser: Boolean(workspace) && session.authenticated, projectManagement: Boolean(registry || catalog) && session.authenticated, ...(projectActions ? { projectArchive: session.authenticated, projectRemoval: session.authenticated, projectReorder: session.authenticated, projectViewPreferences: session.authenticated, projectViewSections: false, projectSections: false } : {}), allThreads: Boolean(workspace) && session.authenticated, overview: true, ...(catalog ? { chatCatalog: session.authenticated, internalThreads: session.authenticated, nativeProjects: session.authenticated, threadMetadata: session.authenticated, ...(!sharedMode ? { runtimeIdleMinutes: 120, runtimePresence: session.authenticated && presenceEnabled, keepRunning: session.authenticated && typeof rpc.setKeepRunning === 'function' } : {}) } : {}), ...(runtimeMode ? { runtimeManagement: session.authenticated, archiveManagement: session.authenticated, library: session.authenticated } : {}), ...(sharedMode ? { sharedDaemon: session.authenticated, composerModels: session.authenticated, threadContext: session.authenticated, permissionProfiles: session.authenticated, attachments: session.authenticated && Boolean(attachments), ...(attachments ? { attachmentLimits: ATTACHMENT_LIMITS, attachmentAccept: ATTACHMENT_ACCEPT } : {}), reconnect: session.authenticated, steer: session.authenticated, userInput: session.authenticated, runtimeManagement: false, archiveManagement: session.authenticated, archiveAtomicity: 'gateway-admission-only', library: session.authenticated } : {}), ...(devices ? { deviceAuthentication: true } : {}) }, ...(devices ? { trustedDevice: session.authenticated && session.deviceId ? await devices.status(session.deviceId) : null } : {}), ...(workspace && session.authenticated ? { workspace: { roots: workspace.roots, defaultCwd: workspace.defaultCwd } } : {}), pendingApprovals: session.authenticated ? [...approvals.values()].map(({ rpcId, ...a }) => a) : [], ...(sharedMode ? { pendingUserInputs: session.authenticated ? [...userInputs.values()].map(({ rpcId, ...a }) => a) : [] } : {}), pendingArchiveOperations: session.authenticated && archive ? await archive.listOperations(archiveOwner) : [], ...(projectActions && session.authenticated ? { projectView: projectActions.view(), pendingProjectOperations: projectActions.listOperations(archiveOwner), recentProjectOperations: projectActions.listOperations(archiveOwner, { includeComplete: true }) } : {}) }); };
+  const snapshot = async (session, sid) => { const listedProjects = session.authenticated ? catalog ? await catalogProjects() : [...projects.values()] : []; return ({ mode: mock ? 'mock' : 'production', authenticated: session.authenticated, csrf: session.csrf, ...(loopbackHttp ? { authTransport: 'bearer', ...(sid ? { sessionToken: sid } : {}) } : {}), connected: upstreamStatus() === 'connected', upstreamStatus: upstreamStatus(), eventTransport: loopbackHttp ? 'poll' : config.eventTransport || 'sse', eventCursor: session.authenticated ? nextEvent : 0, projects: listedProjects, capabilities: { terminal: session.authenticated && terminals.capability(), workspaceBrowser: Boolean(workspace) && session.authenticated, projectManagement: Boolean(registry || catalog) && session.authenticated, ...(projectActions ? { projectArchive: session.authenticated, projectRemoval: session.authenticated, projectReorder: session.authenticated, projectViewPreferences: session.authenticated, projectViewSections: false, projectSections: false } : {}), allThreads: Boolean(workspace) && session.authenticated, overview: true, ...(catalog ? { chatCatalog: session.authenticated, internalThreads: session.authenticated, nativeProjects: session.authenticated, threadMetadata: session.authenticated, ...(!sharedMode ? { runtimeIdleMinutes: 120, runtimePresence: session.authenticated && presenceEnabled, keepRunning: session.authenticated && typeof rpc.setKeepRunning === 'function' } : {}) } : {}), ...(runtimeMode ? { runtimeManagement: session.authenticated, archiveManagement: session.authenticated, library: session.authenticated } : {}), ...(sharedMode ? { sharedDaemon: session.authenticated, subagents: session.authenticated, composerModels: session.authenticated, threadContext: session.authenticated, permissionProfiles: session.authenticated, attachments: session.authenticated && Boolean(attachments), ...(attachments ? { attachmentLimits: ATTACHMENT_LIMITS, attachmentAccept: ATTACHMENT_ACCEPT } : {}), reconnect: session.authenticated, steer: session.authenticated, userInput: session.authenticated, runtimeManagement: false, archiveManagement: session.authenticated, archiveAtomicity: 'gateway-admission-only', library: session.authenticated } : {}), ...(devices ? { deviceAuthentication: true } : {}) }, ...(devices ? { trustedDevice: session.authenticated && session.deviceId ? await devices.status(session.deviceId) : null } : {}), ...(workspace && session.authenticated ? { workspace: { roots: workspace.roots, defaultCwd: workspace.defaultCwd } } : {}), pendingApprovals: session.authenticated ? [...approvals.values()].map(({ rpcId, ...a }) => a) : [], ...(sharedMode ? { pendingUserInputs: session.authenticated ? [...userInputs.values()].map(({ rpcId, ...a }) => a) : [] } : {}), pendingArchiveOperations: session.authenticated && archive ? await archive.listOperations(archiveOwner) : [], ...(projectActions && session.authenticated ? { projectView: projectActions.view(), pendingProjectOperations: projectActions.listOperations(archiveOwner), recentProjectOperations: projectActions.listOperations(archiveOwner, { includeComplete: true }) } : {}) }); };
   const headers = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", 'Cross-Origin-Resource-Policy': 'same-origin' };
   const json = (res, status, data) => { res.writeHead(status, { ...headers, 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data)); };
   const readBody = async req => {
@@ -511,7 +518,7 @@ export async function createRelay({ mock = true, config = { projects: [{ id: 'ho
       if (req.headers['sec-fetch-site'] === 'cross-site') fail(403, 'origin_rejected', '拒绝跨站请求。');
       if (loopbackHttp && (!req.url.startsWith('/') || req.url.startsWith('//'))) fail(400, 'invalid_query', 'SSH 回环 HTTP 仅接受当前地址的相对路径。');
       const url = new URL(req.url, allowedOrigin);
-      if (url.username || url.password || url.origin !== allowedOrigin || [...url.searchParams.keys()].some(k => !['project', 'cursor', 'thread', ...(url.pathname === '/api/threads' && req.method === 'GET' && (runtimeMode || catalogMode) ? ['archived', ...(catalogMode ? ['search', 'pinned', 'includeInternal'] : [])] : []), ...(url.pathname === '/api/poll' ? ['wait'] : []), ...(url.pathname === '/api/directories' ? ['path'] : []), ...(url.pathname === '/api/projects' && req.method === 'GET' && !catalogMode ? ['cwd'] : [])].includes(k)) || ['project', 'cursor', 'thread', 'path', 'cwd', 'archived', 'search', 'pinned', 'includeInternal'].some(key => url.searchParams.getAll(key).length > 1)) fail(400, 'invalid_query', '不接受此 URL 参数。');
+      if (url.username || url.password || url.origin !== allowedOrigin || [...url.searchParams.keys()].some(k => !['project', 'cursor', 'thread', ...(url.pathname === '/api/threads' && req.method === 'GET' && (runtimeMode || catalogMode) ? ['archived', ...(catalogMode ? ['search', 'pinned', 'includeInternal'] : [])] : []), ...(url.pathname === '/api/subagents' && req.method === 'GET' && sharedMode ? ['parent'] : []), ...(url.pathname === '/api/poll' ? ['wait'] : []), ...(url.pathname === '/api/directories' ? ['path'] : []), ...(url.pathname === '/api/projects' && req.method === 'GET' && !catalogMode ? ['cwd'] : [])].includes(k)) || ['project', 'parent', 'cursor', 'thread', 'path', 'cwd', 'archived', 'search', 'pinned', 'includeInternal'].some(key => url.searchParams.getAll(key).length > 1)) fail(400, 'invalid_query', '不接受此 URL 参数。');
       if (req.method === 'OPTIONS') fail(405, 'method_forbidden', '不支持跨域请求。');
       if (loopbackHttp && url.pathname.startsWith('/api/') && req.headers['x-relay-origin'] !== allowedOrigin) fail(403, 'origin_required', 'SSH 回环 HTTP 请求需要匹配当前地址的 X-Relay-Origin。');
       let sid = loopbackHttp ? /^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.headers.authorization || '')?.[1] : /(?:^|;\s*)relay_session=([A-Za-z0-9_-]+)/.exec(req.headers.cookie || '')?.[1];
@@ -726,6 +733,28 @@ export async function createRelay({ mock = true, config = { projects: [{ id: 'ho
           let nextCursor = null;
           if (remoteCursor) { nextCursor = token(); cursors.set(nextCursor, { kind: 'threads', projectId: filter, archived, remoteCursor }); if (cursors.size > 300) cursors.delete(cursors.keys().next().value); }
           return json(res, 200, { data, nextCursor });
+        }
+        if (sharedMode && url.pathname === '/api/subagents' && req.method === 'GET') {
+          const parentId = url.searchParams.get('parent'), childId = url.searchParams.get('thread'), cursor = url.searchParams.get('cursor');
+          if (!identifier(parentId) || (childId !== null && !identifier(childId)) || (cursor && !childId)) fail(400, 'invalid_thread', '子代理或主对话标识无效。');
+          const scope = `subagents:${parentId}:${sid}`;
+          const position = cursor && cursors.get(cursor);
+          if (cursor && (position?.kind !== 'history-items' || position.projectId !== scope || position.threadId !== childId)) fail(400, 'invalid_cursor', '子代理历史游标无效。');
+          await ensureConnected();
+          const parent = (await rpc.call('thread/read', { threadId: parentId, includeTurns: false }))?.thread;
+          if (parent?.id !== parentId) fail(404, 'thread_unavailable', '主对话不可读取。');
+          await canonicalProject(parent.cwd);
+          if (childId) {
+            const child = (await rpc.call('thread/read', { threadId: childId, includeTurns: false }))?.thread;
+            const agent = child?.id === childId && await subagentMetadata(child, parentId);
+            if (!agent) fail(404, 'subagent_unavailable', '此子代理不属于当前对话，或记录不可读取。');
+            const page = await historyPage(childId, position?.remoteCursor, 100);
+            return json(res, 200, { agent, turns: page.turns, nextCursor: historyCursor(scope, childId, page.nextCursor) });
+          }
+          const page = await rpc.call('thread/list', { ancestorThreadId: parentId, sourceKinds: ['subAgentThreadSpawn'], useStateDbOnly: true, limit: 100, sortKey: 'updated_at', sortDirection: 'desc' });
+          if (!Array.isArray(page?.data) || page.data.length > 100) fail(502, 'protocol_mismatch', '子代理列表格式无效。');
+          const agents = (await Promise.all(page.data.map(thread => subagentMetadata(thread, parentId)))).filter(Boolean);
+          return json(res, 200, { agents, hasMore: !!page.nextCursor });
         }
         if (url.pathname === '/api/history' && req.method === 'GET') {
           const eventCursor = nextEvent, threadId = url.searchParams.get('thread'), p = runtimeMode || catalog ? { id: 'library' } : project(url.searchParams.get('project'));
@@ -969,7 +998,7 @@ export async function createRelay({ mock = true, config = { projects: [{ id: 'ho
         fail(404, 'not_found', '接口不存在。');
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') fail(405, 'method_forbidden', '不支持此方法。');
-      const staticPaths = { '/': 'index.html', '/index.html': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css', '/styles.css': 'styles.css', '/terminal.js': 'terminal.js', '/terminal.css': 'terminal.css', '/vendor/xterm.js': 'vendor/xterm.js', '/vendor/xterm.css': 'vendor/xterm.css', '/vendor/xterm-addon-fit.js': 'vendor/xterm-addon-fit.js' };
+      const staticPaths = { '/': 'index.html', '/index.html': 'index.html', '/app.js': 'app.js', '/message-markdown.js': 'message-markdown.js', '/vendor/markdown-it.js': 'vendor/markdown-it.js', '/style.css': 'style.css', '/styles.css': 'styles.css', '/terminal.js': 'terminal.js', '/terminal.css': 'terminal.css', '/vendor/xterm.js': 'vendor/xterm.js', '/vendor/xterm.css': 'vendor/xterm.css', '/vendor/xterm-addon-fit.js': 'vendor/xterm-addon-fit.js' };
       const name = staticPaths[url.pathname]; if (!name) fail(404, 'not_found', '文件不存在。');
       let file; try { file = await readFile(resolve(PUBLIC, name)); } catch { fail(404, 'not_found', '文件不存在。'); }
       const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };

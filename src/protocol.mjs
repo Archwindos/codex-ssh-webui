@@ -174,11 +174,25 @@ export function safeItem(item) {
     if (attachments.length) result.attachments = attachments;
   }
   else if (item.type === 'reasoning') { result.summary = textParts(item.summary); result.content = textParts(item.content); result.truncated = [item.summary, item.content].some(parts => Array.isArray(parts) && (parts.length > 100 || parts.reduce((total, part) => total + (typeof part === 'string' ? part.length : 0), 0) > 20000)); }
-  else if (item.type === 'commandExecution') { result.command = text(item.command, 2000); result.cwd = text(item.cwd, 1000); result.status = text(item.status, 80); result.aggregatedOutput = text(item.aggregatedOutput); result.truncated = typeof item.aggregatedOutput === 'string' && item.aggregatedOutput.length > 20000; result.exitCode = Number.isInteger(item.exitCode) ? item.exitCode : null; }
+  else if (item.type === 'commandExecution') {
+    result.command = text(item.command, 2000); result.cwd = text(item.cwd, 1000); result.status = text(item.status, 80);
+    result.aggregatedOutput = text(item.aggregatedOutput); result.truncated = typeof item.aggregatedOutput === 'string' && item.aggregatedOutput.length > 20000; result.exitCode = Number.isInteger(item.exitCode) ? item.exitCode : null;
+    if (Array.isArray(item.commandActions)) result.commandActions = item.commandActions.slice(0, 24).filter(action => ['read', 'search', 'listFiles', 'unknown'].includes(action?.type)).map(action => ({ type: action.type, name: text(action.name, 240), path: text(action.path, 1000), query: text(action.query, 240) }));
+  }
   else if (item.type === 'fileChange') { result.status = text(item.status, 80); result.changes = (Array.isArray(item.changes) ? item.changes : []).slice(0, 100).map(x => ({ path: text(x.path, 1000), kind: text(typeof x.kind === 'string' ? x.kind : x.kind?.type, 80), diff: text(x.diff) })); }
-  else if (item.type === 'mcpToolCall') { result.server = text(item.server, 200); result.tool = text(item.tool, 200); result.status = text(item.status, 80); }
+  else if (item.type === 'mcpToolCall' || item.type === 'dynamicToolCall') { result.server = text(item.server, 200); result.tool = text(item.tool, 200); result.status = text(item.status, 80); }
   else if (item.type === 'webSearch') { result.query = text(item.query, 2000); if (['search', 'openPage', 'findInPage'].includes(item.action?.type)) result.action = { type: item.action.type, query: text(item.action.query, 2000), queries: textParts(item.action.queries), url: text(item.action.url, 2000), pattern: text(item.action.pattern, 2000) }; }
-  else if (item.type === 'collabAgentToolCall') { result.tool = text(item.tool, 100); result.status = text(item.status, 80); result.senderThreadId = text(item.senderThreadId, 200); result.receiverThreadIds = (Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : []).slice(0, 100).map(id => text(id, 200)); }
+  else if (item.type === 'subAgentActivity') {
+    result.kind = ['started', 'interacted', 'interrupted', 'completed'].includes(item.kind) ? item.kind : null;
+    result.agentThreadId = text(item.agentThreadId, 160); result.agentPath = text(item.agentPath, 500);
+  } else if (item.type === 'collabAgentToolCall') {
+    result.tool = text(item.tool, 100); result.status = text(item.status, 80); result.senderThreadId = text(item.senderThreadId, 200);
+    result.receiverThreadIds = (Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : []).filter(id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,160}$/.test(id)).slice(0, 100);
+    result.agentsStates = Object.fromEntries(result.receiverThreadIds.flatMap(id => {
+      const status = item.agentsStates?.[id]?.status;
+      return ['pendingInit', 'running', 'interrupted', 'completed', 'errored', 'shutdown', 'notFound'].includes(status) ? [[id, { status }]] : [];
+    }));
+  }
   return result;
 }
 export const MAX_SAFE_TURN_ITEMS = 10000;

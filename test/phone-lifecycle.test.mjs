@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
+import { appFixtureSource } from './ui-source-fixture.mjs';
 
 const appPath = process.env.PHONE_LIFECYCLE_APP_PATH || new URL('../public/app.js', import.meta.url);
-const source = (await readFile(appPath, 'utf8')).replace(/run\(\(\) => hydrate\(\)\);\s*$/, '');
+const source = appFixtureSource(await readFile(appPath, 'utf8'));
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
 const response = body => ({ ok: true, status: 200, json: async () => body });

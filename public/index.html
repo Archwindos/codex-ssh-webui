@@ -31,6 +31,7 @@
       <header class="topbar"><div class="topbar-title"><button class="icon-button mobile-only" id="open-sidebar" aria-label="打开会话历史" aria-controls="sidebar" aria-expanded="false"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button><div><h1 id="thread-title">工作台</h1><p id="server-label">服务器 Codex</p></div></div><div class="topbar-actions"><div class="connection" id="connection" role="status"><span class="status-dot"></span><span id="connection-text">连接中</span></div><button id="reconnect" class="secondary reconnect-button" hidden>重新连接</button><button id="open-server" class="icon-button" aria-label="服务器状态与终端" title="服务器" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="3" width="16" height="7" rx="2"/><rect x="4" y="14" width="16" height="7" rx="2"/><path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5"/></svg></button><button id="top-new-thread" class="icon-button" aria-label="新建会话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></div></header>
       <div id="mode-banner" class="mode-banner" hidden><span class="demo-label">本地演示</span><span>使用模拟消息，不连接服务器，不调用模型。</span></div>
       <div id="error" class="error-banner" role="alert" hidden><span id="error-text"></span><button id="dismiss-error" class="text-button">关闭提示</button></div>
+      <div id="subagent-roster" class="subagent-roster" hidden><span id="subagent-roster-label">子代理</span><div id="subagent-roster-list" class="subagent-roster-list" aria-label="子代理状态"></div></div>
       <section id="login" class="login-panel" hidden aria-labelledby="login-title"><h2 id="login-title">连接你的工作台</h2><div id="device-login" hidden><p>信任此浏览器后，可自动连接工作台，无需每次输入口令。</p><p id="device-login-status" class="device-login-status" role="status"></p><button id="trust-browser" class="primary" hidden>信任此浏览器</button><button id="device-retry" class="secondary" hidden>重试浏览器认证</button><button id="show-recovery" class="text-button">使用恢复口令</button></div><div id="recovery-login"><p>使用管理员提供的恢复口令连接工作台。服务器的 ChatGPT 登录由现有 Codex 保管。</p><form id="login-form"><label for="secret">恢复口令</label><input id="secret" type="password" autocomplete="current-password" required><button class="primary" type="submit">登录工作台</button></form></div></section>
       <section class="home-view" id="home-view" aria-labelledby="home-title" hidden>
         <div class="home-content"><div class="section-heading"><div><h2 id="home-title">主页</h2><p id="agent-summary" class="muted">正在读取服务器状态…</p></div><div class="home-actions"><button class="secondary terminal-open" id="open-terminal" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 6 6 6-6 6M13 18h6"/></svg><span>临时终端</span></button><button class="icon-button" id="refresh-overview" aria-label="刷新服务器状态"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 10a8 8 0 1 0-2 8M20 4v6h-6"/></svg></button></div></div>
@@ -83,6 +84,18 @@
         </form><p class="composer-note" id="composer-note">需要权限时，由你确认后继续。</p></footer>
       <nav class="mobile-tabs" id="mobile-tabs" aria-label="工作台导航"><button id="mobile-home" class="active"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 11 9-8 9 8M5 9v12h14V9M9 21v-7h6v7"/></svg><span id="mobile-home-label">主页</span></button><button id="mobile-chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v17H4ZM8 8h8M8 12h8M8 16h5"/></svg><span id="mobile-chat-label">对话库</span></button></nav>
     </main>
+    <aside id="subagent-panel" class="subagent-panel" aria-labelledby="subagent-panel-title" hidden>
+      <header class="subagent-panel-header">
+        <button id="close-subagent" class="icon-button" type="button" aria-label="返回主对话" title="返回主对话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6M8 12h12"/></svg></button>
+        <div><h2 id="subagent-panel-title"></h2><p id="subagent-panel-status" role="status"></p></div>
+      </header>
+      <div id="subagent-scroll" class="subagent-scroll" tabindex="0" aria-label="子代理对话">
+        <button id="subagent-older" class="text-button" type="button" hidden>加载更早的活动</button>
+        <p id="subagent-empty" class="subagent-empty" role="status" hidden></p>
+        <div id="subagent-error" class="subagent-error" role="status" hidden><span>暂时无法读取子代理进展。</span><button id="retry-subagent" class="text-button" type="button">重试</button></div>
+        <div id="subagent-messages" class="subagent-messages"></div>
+      </div>
+    </aside>
   </div>
 </body>
 </html>

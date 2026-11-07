@@ -76,6 +76,47 @@ async function fixture(t, options = {}) {
 }
 const mutations = rpc => rpc.calls.filter(call => ['thread/resume', 'thread/start', 'turn/start', 'turn/steer', 'turn/interrupt'].includes(call.method));
 
+test('subagent inspection reads the direct child and binds history cursors to its parent and browser session', async t => {
+  const f = await fixture(t, { configure(rpc, cwd) {
+    rpc.seed('worker', cwd, true, {
+      name: 'Independent review', parentThreadId: 'shared-live', agentNickname: 'Review',
+      source: { subAgent: { thread_spawn: { parent_thread_id: 'shared-live', agent_path: '/root/independent_review' } } },
+      status: { type: 'active', activeFlags: ['waitingOnApproval'] },
+      turns: [{ id: 'worker-turn', status: 'inProgress', items: Array.from({ length: 101 }, (_, i) => ({ id: `worker-item-${i}`, type: 'agentMessage', text: `Progress ${i}` })) }],
+    });
+    rpc.seed('nested', cwd, true, { parentThreadId: 'worker' });
+    rpc.seed('conflict', cwd, true, { parentThreadId: 'shared-live', source: { subAgent: { thread_spawn: { parent_thread_id: 'saved-only' } } } });
+  } });
+  assert.equal(f.session.data.capabilities.subagents, true);
+  const roster = await f.request('/api/subagents?parent=shared-live');
+  assert.equal(roster.status, 200);
+  assert.deepEqual(roster.data.agents.map(agent => [agent.id, agent.status.activeFlags]), [['worker', ['waitingOnApproval']]]);
+  const path = '/api/subagents?parent=shared-live&thread=worker';
+  const first = await f.request(path);
+  assert.equal(first.status, 200);
+  assert.equal(first.data.agent.name, 'Independent review');
+  assert.equal(first.data.turns[0].items.length, 100);
+  const cursor = encodeURIComponent(first.data.nextCursor);
+  assert.equal((await f.request(`${path}&cursor=${cursor}`)).data.turns[0].items[0].id, 'worker-item-0');
+  const other = f.client(); await other('/api/session');
+  assert.equal((await other(`${path}&cursor=${cursor}`)).status, 400);
+  for (const id of ['nested', 'conflict', 'saved-only']) assert.equal((await f.request(`/api/subagents?parent=shared-live&thread=${id}`)).status, 404);
+  assert.deepEqual(mutations(f.rpc), []);
+});
+
+test('native activity metadata survives the history response for command summaries and child links', async t => {
+  const f = await fixture(t, { configure(rpc) {
+    rpc.threads.get('shared-live').turns = [{ id: 'work', status: 'completed', items: [
+      { id: 'read', type: 'commandExecution', command: 'cat notes.md', commandActions: [{ type: 'read', path: 'notes.md', name: 'notes.md' }] },
+      { id: 'worker', type: 'subAgentActivity', kind: 'started', agentThreadId: 'review', agentPath: '/root/review' },
+    ] }];
+  } });
+  const history = await f.request('/api/history?thread=shared-live');
+  const [command, agent] = history.data.turns[0].items;
+  assert.equal(command.commandActions[0].name, 'notes.md');
+  assert.deepEqual(agent, { id: 'worker', type: 'subAgentActivity', kind: 'started', agentThreadId: 'review', agentPath: '/root/review' });
+});
+
 test('shared mode uses native loaded threads and preserves peer-writable conversations without runtime ownership', async t => {
   const f = await fixture(t), caps = f.session.data.capabilities;
   assert.equal(caps.sharedDaemon, true); assert.equal(caps.chatCatalog, true); assert.equal(caps.runtimeManagement, false); assert.equal(caps.archiveManagement, true);

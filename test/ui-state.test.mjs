@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
+import { appFixtureSource } from './ui-source-fixture.mjs';
 import { webcrypto } from 'node:crypto';
 
-const source = (await readFile(new URL('../public/app.js', import.meta.url), 'utf8')).replace(/run\(\(\) => hydrate\(\)\);\s*$/, '');
+const source = appFixtureSource(await readFile(new URL('../public/app.js', import.meta.url), 'utf8'));
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const response = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
 const textOf = node => [node.textContent, ...node.children.map(textOf)].filter(Boolean).join(' ');
